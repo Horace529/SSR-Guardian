@@ -429,3 +429,6 @@ FodyWeavers.xsd
 *.msp
 desktop.ini
 *.pdf
+/.obsidian
+.obsidian/app.json
+/.obsidian
