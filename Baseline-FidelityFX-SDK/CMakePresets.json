@@ -1,0 +1,62 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 23,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "vs2026-x64-base",
+            "hidden": true,
+            "generator": "Visual Studio 18 2026",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "samples-dx12",
+            "displayName": "FidelityFX SDK Samples DX12 (VS2026 x64)",
+            "description": "与打包构建配置一致：HybridReflections sample，后端静态链接（CLASSIFIER+DENOISER+SPD 组件）",
+            "inherits": "vs2026-x64-base",
+            "cacheVariables": {
+                "BUILD_TYPE": "SAMPLES_DX12",
+                "FFX_HYBRIDREFLECTIONS": "ON",
+                "RUNTIME_SHADER_RECOMPILE": "0"
+            }
+        },
+        {
+            "name": "samples-vk",
+            "displayName": "FidelityFX SDK Samples VK (VS2026 x64)",
+            "description": "需要先安装 Vulkan SDK（find_package(Vulkan REQUIRED)），本机暂未安装",
+            "inherits": "vs2026-x64-base",
+            "cacheVariables": {
+                "BUILD_TYPE": "SAMPLES_VK",
+                "FFX_HYBRIDREFLECTIONS": "ON",
+                "RUNTIME_SHADER_RECOMPILE": "0"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "samples-dx12-debug",
+            "displayName": "Build Samples DX12 DebugDX12",
+            "configurePreset": "samples-dx12",
+            "configuration": "DebugDX12"
+        },
+        {
+            "name": "samples-dx12-release",
+            "displayName": "Build Samples DX12 ReleaseDX12",
+            "configurePreset": "samples-dx12",
+            "configuration": "ReleaseDX12"
+        },
+        {
+            "name": "samples-dx12-relwithdebinfo",
+            "displayName": "Build Samples DX12 RelWithDebInfoDX12",
+            "configurePreset": "samples-dx12",
+            "configuration": "RelWithDebInfoDX12"
+        }
+    ]
+}

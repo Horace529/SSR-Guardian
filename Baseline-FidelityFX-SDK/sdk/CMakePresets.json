@@ -1,0 +1,48 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 23,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "sdk-dx12-x64",
+            "displayName": "FidelityFX SDK Backend DX12 (VS2026 x64)",
+            "description": "与打包构建一致：DX12_X64 后端，AUTO_COMPILE_SHADERS，组件 CLASSIFIER+DENOISER+SPD；只有修改 sdk 源码后才需要重新构建",
+            "generator": "Visual Studio 18 2026",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "FFX_API_BACKEND": "DX12_X64",
+                "FFX_AUTO_COMPILE_SHADERS": "1",
+                "FFX_CLASSIFIER": "ON",
+                "FFX_DENOISER": "ON",
+                "FFX_SPD": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "sdk-dx12-x64-debug",
+            "displayName": "Build SDK Backend DX12 Debug",
+            "configurePreset": "sdk-dx12-x64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "sdk-dx12-x64-release",
+            "displayName": "Build SDK Backend DX12 Release",
+            "configurePreset": "sdk-dx12-x64",
+            "configuration": "Release"
+        },
+        {
+            "name": "sdk-dx12-x64-relwithdebinfo",
+            "displayName": "Build SDK Backend DX12 RelWithDebInfo",
+            "configurePreset": "sdk-dx12-x64",
+            "configuration": "RelWithDebInfo"
+        }
+    ]
+}
