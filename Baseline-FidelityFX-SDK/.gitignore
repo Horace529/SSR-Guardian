@@ -373,3 +373,17 @@ sdk/src/components/fsr3/FSR3_GDK/Gaming.Xbox.Scarlett.x64/
 sdk/src/components/fsr3upscaler/FSR3Upscaler_GDK/Gaming.Xbox.Scarlett.x64/
 
 sdk/src/components/opticalflow/OpticalFlow_GDK/Gaming.Xbox.Scarlett.x64/
+
+# AMD-shipped runtime binaries (not build output - must be tracked)
+!sdk/libs/pix/bin/
+!sdk/libs/pix/bin/**
+!framework/cauldron/framework/libs/agilitysdk/bin/
+!framework/cauldron/framework/libs/agilitysdk/bin/x64/
+!framework/cauldron/framework/libs/agilitysdk/bin/x64/**
+!framework/cauldron/framework/libs/dxc/bin/
+!framework/cauldron/framework/libs/dxc/bin/x64/
+!framework/cauldron/framework/libs/dxc/bin/x64/**
+!framework/cauldron/framework/libs/pix/bin/
+!framework/cauldron/framework/libs/pix/bin/x64/
+!framework/cauldron/framework/libs/pix/bin/arm64/
+!framework/cauldron/framework/libs/pix/bin/**
