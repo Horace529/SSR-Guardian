@@ -142,6 +142,8 @@ root `bin/`、`build/`、`sdk/build/` 仍为忽略（纯构建产物）。今后
 | 热键 | **F9** 随时切换武装状态（不播放时也可按） |
 | 无头批量 | 启动前设环境变量 `CAULDRON_AUTO_RECORD=1`（自动武装）、`CAULDRON_AUTO_PLAY=<索引或轨迹名子串>`（自动开播） |
 
+**当前库存**（2026-10-20 重录，全部通过完整性校验）：五条轨迹各一条完整圈 take（`*_lap{2,4,6,8,10}_*.posebin`，4672–4949 记录，零残尾/零帧间隙/时钟零回退，无人机运动正常），已纳入 git 跟踪，作为 M2/M3 离线采集的输入。
+
 **会话语义**：录制会话存在当且仅当 `武装 && 播放中`。圈（lap）边界（自然 loop 回绕 / F8 / 场景切换）自动关闭当前文件、下一帧开新文件——**一圈一个 take**。停止播放（F7）或取消武装即收尾。
 
 **输出格式**（`autocamera/recordings/<轨迹名>_lap<N>_<时间戳>.posebin`）：
@@ -184,12 +186,12 @@ entity_count u32 | 各动画实体世界矩阵 f32[16] × N（顺序 == 头内�
 
 **使用方式**：
 
-```bat
-set CAULDRON_AUTO_PLAYBACK=D:\...\autocamera\recordings\01_floor_lanes_lap2_20261020_135120.posebin
-FFX_HYBRIDREFLECTIONS_DX12.exe
-```
+| 方式 | 操作 |
+|---|---|
+| UI | "Auto Camera Paths" 窗口的 **Playback Takes** 区块：自动扫描录制目录按新到旧列出全部 take，点按钮即回放（Refresh 重新扫描） |
+| 无头批量 | 启动前设环境变量 `CAULDRON_AUTO_PLAYBACK=<posebin 路径>` |
 
-回放无缝循环；**F8** 从头重放；**F7** 停止并恢复自由相机；UI 显示蓝色 PLAYBACK 状态行（源名 / 帧进度 / 圈次）。可与录制同时开启（`CAULDRON_AUTO_RECORD=1`）——用于往返校验或派生 take。
+回放无缝循环；**F8** 从头重放；**F7** 停止并恢复自由相机；UI 显示蓝色 PLAYBACK 状态行（源名 / 帧进度 / 圈次）。可与录制同时开启（`CAULDRON_AUTO_RECORD=1`）——用于往返校验或派生 take。模式互斥：点轨迹按钮会干净退出回放，回放激活时轨迹按钮高亮被抑制。
 
 **机制**（与数据公理一一对应）：
 
@@ -227,7 +229,7 @@ FFX_HYBRIDREFLECTIONS_DX12.exe
 |---|---|
 | `SSR-Guardian技术路线.md` | 技术决策总览：管线解剖、鉴别器设计、数据工厂、预算、里程碑状态 |
 | `SSR-Guardian代码改造说明.md` | 本文 |
-| `Baseline-FidelityFX-SDK/autocamera/recordings/` | 录制产出目录（.posebin takes；`01_floor_lanes_lap2_*` 为 M1 基准 take，回放验证的对照源） |
+| `Baseline-FidelityFX-SDK/autocamera/recordings/` | 录制产出目录（.posebin takes，已入 git；五条轨迹各一条完整圈，M2/M3 采集输入） |
 
 ---
 
@@ -236,6 +238,6 @@ FFX_HYBRIDREFLECTIONS_DX12.exe
 1. `json.h` 的 filesystem 检测守卫是刻意的——升级该 vendored 库时保留其自带逻辑
 2. 录制器输出目录候选 `../autocamera/recordings` → `recordings`（相对 exe 工作目录 `bin/`）
 3. posebin 的 JSON 头按行解析（单行、`\n` 结束），实体名经 UTF-8 转换（`misc/helpers.h` 的 `WStringToString`）；回放端用 `json >> header` 解析后逐字符消费到 `\n` 定位数据区起点
-4. 录制文件建议入 git（当前 `.gitignore` 未排除 `autocamera/recordings`，注意单文件 GB 级时再调整策略）
+4. posebin take 已纳入 git 跟踪（当前 5 条约 78MB，单文件 15–16MB，低于 GitHub 100MB 红线）；`01_floor_lanes_playback_lap1_145019`（M1 往返校验副产物）已随重录清理。将来量产时单文件若逼近 100MB 或总量失控，再调整（如 LFS 或不入库）
 5. MSBuild 参数在 Git Bash 下用 `-p:` 形式（`/p:` 会被路径转换破坏）；构建命令模板见技术路线文档第 6 节
 6. 回放模式当前要求场景与录制时完全一致（实体数量 + 名字逐一校验）——将来多场景数据集需要 take 内记录场景标识并校验
