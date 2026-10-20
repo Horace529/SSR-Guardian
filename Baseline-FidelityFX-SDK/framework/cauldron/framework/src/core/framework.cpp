@@ -32,6 +32,7 @@
 #include "core/components/meshcomponent.h"
 #include "core/components/animationcomponent.h"
 #include "core/components/particlespawnercomponent.h"
+#include "core/autocamera.h"
 #include "core/contentmanager.h"
 #include "core/inputmanager.h"
 #include "core/uimanager.h"
@@ -1662,6 +1663,11 @@ namespace cauldron
             for (auto compMgrIter = m_ComponentManagers.begin(); compMgrIter != m_ComponentManagers.end(); ++compMgrIter)
                 compMgrIter->second->UpdateComponents(m_DeltaTime);
         }
+
+        // Pose-sequence recording (SSR-Guardian data capture). Must run after the component
+        // update pass above so camera and animated entity transforms are final for the frame
+        // that is about to be rendered.
+        AutoCameraController::Get().RecordFrame(m_DeltaTime);
 
         // This can be closed out, new cmd lists will be opened after
         CloseCmdList(m_pCmdListForFrame);

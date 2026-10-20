@@ -100,6 +100,12 @@ namespace cauldron
         void ResetAnimationTime() { m_ElapsedTime = 0.0; }
 
         /**
+         * @brief   Current animation clock (seconds). Every animated entity transform produced
+         *          by the next UpdateComponents is a function of this value.
+         */
+        double GetElapsedTime() const { return m_ElapsedTime; }
+
+        /**
          * @brief   Component manager instance accessor.
          */
         static AnimationComponentMgr* Get() { return s_pComponentManager; }

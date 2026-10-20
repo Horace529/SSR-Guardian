@@ -26,6 +26,7 @@
 
 #include <string>
 #include <vector>
+#include <fstream>
 
 namespace cauldron
 {
@@ -113,6 +114,22 @@ namespace cauldron
 
         bool IsPlaying() const { return m_Playing; }
 
+        /**
+         * @brief   Writes one pose-sequence record if a recording session is active. A session
+         *          exists only while the recorder is armed AND a path is playing, so ordering
+         *          matters: arm first (UI checkbox, F9, or CAULDRON_AUTO_RECORD=1), then start
+         *          a path. Called from the framework AFTER all component managers have updated,
+         *          so camera and animated entity transforms are final for the rendered frame.
+         *
+         *          Record layout (little-endian, after a JSON header line):
+         *          frame_index u64 | lap u32 | anim_clock f64 | delta_time f64 | path_time f64 |
+         *          cam_pos f32[3] | cam_look f32[3] | cam_inv_view f32[16] | entity_count u32 |
+         *          entity_count x world_matrix f32[16] (row-major listing, order == header table)
+         */
+        void RecordFrame(double deltaTime);
+
+        bool IsRecording() const { return m_Recording; }
+
     private:
         AutoCameraController();
         AutoCameraController(const AutoCameraController&) = delete;
@@ -122,12 +139,30 @@ namespace cauldron
         void RestartLap();
         bool Evaluate(double t, Vec4& pos, Vec4& look) const;
 
+        void StartRecordingSession();
+        void EndRecordingSession();
+        static std::string ToUtf8(const std::wstring& text);
+
         std::vector<AutoCamPath> m_Paths;
         int                      m_ActivePath = -1;
         bool                     m_Playing = false;
         double                   m_PathTime = 0.0;
         uint32_t                 m_Lap = 0;
         const void*              m_pLastScene = nullptr;
+
+        // Pose sequence recording
+        bool                      m_RecordArmed = false;
+        bool                      m_Recording = false;
+        uint64_t                  m_FramesWritten = 0;
+        uint32_t                  m_SessionEntityCount = 0;
+        std::vector<std::wstring> m_SessionEntityNames;
+        std::vector<char>         m_RecordScratch;
+        std::ofstream             m_RecordStream;
+        std::wstring              m_RecordFilePath;
+        std::string               m_RecordFileTag;
+        Vec4                      m_LastPos = Vec4(0.f, 0.f, 0.f, 0.f);
+        Vec4                      m_LastLook = Vec4(0.f, 1.f, 0.f, 0.f);
+        class CameraComponent*    m_pLastCamera = nullptr;
     };
 
 } // namespace cauldron
