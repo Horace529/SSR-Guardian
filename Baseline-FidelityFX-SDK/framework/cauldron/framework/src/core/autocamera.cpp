@@ -67,7 +67,9 @@ namespace cauldron
     AutoCameraController::AutoCameraController()
     {
         // Headless/batch data capture hooks: CAULDRON_AUTO_RECORD=1 arms pose recording at
-        // startup, CAULDRON_AUTO_PLAY=<index or name substring> starts that path automatically.
+        // startup, CAULDRON_AUTO_PLAY=<index or name substring> starts that path automatically,
+        // CAULDRON_AUTO_PLAYBACK=<posebin path> replays a recorded take instead of live paths
+        // (takes precedence over CAULDRON_AUTO_PLAY).
         wchar_t envValue[64] = {};
         if (GetEnvironmentVariableW(L"CAULDRON_AUTO_RECORD", envValue, 64) > 0 && wcscmp(envValue, L"0") != 0)
         {
@@ -77,7 +79,13 @@ namespace cauldron
 
         LoadPaths();
 
-        if (GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAY", envValue, 64) > 0 && envValue[0] != L'\0')
+        wchar_t playbackPath[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAYBACK", playbackPath, MAX_PATH) > 0 && playbackPath[0] != L'\0')
+        {
+            LoadPosePlayback(playbackPath);
+        }
+
+        if (!m_PlaybackLoaded && GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAY", envValue, 64) > 0 && envValue[0] != L'\0')
         {
             bool started = false;
             if (iswdigit(envValue[0]))
@@ -290,6 +298,9 @@ namespace cauldron
             }
         }
 
+        if (m_PlaybackLoaded)
+            return UpdatePlayback(pCamera);
+
         if (!m_Playing || pCamera == nullptr || m_ActivePath < 0)
             return false;
 
@@ -354,6 +365,12 @@ namespace cauldron
             ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.35f, 1.0f), "RECORDING: %s", m_RecordFileTag.c_str());
             ImGui::Text("Frames written: %llu", static_cast<unsigned long long>(m_FramesWritten));
         }
+        if (m_PlaybackLoaded && m_Playing)
+        {
+            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "PLAYBACK: %s", m_PlaybackSourceName.c_str());
+            ImGui::Text("Frame %llu / %llu  (lap %u, F8 restarts)",
+                        static_cast<unsigned long long>(m_PlaybackFrame), static_cast<unsigned long long>(m_PlaybackFrameCount), m_Lap);
+        }
         ImGui::Spacing();
 
         for (size_t i = 0; i < m_Paths.size(); ++i)
@@ -398,9 +415,20 @@ namespace cauldron
 
     void AutoCameraController::StartRecordingSession()
     {
-        if (m_ActivePath < 0)
-            return;
-        const AutoCamPath& path = m_Paths[m_ActivePath];
+        std::string sourceName;
+        double duration = 0.0;
+        if (m_PlaybackLoaded)
+        {
+            sourceName = m_PlaybackSourceName + "_playback";
+            duration = m_PlaybackDuration;
+        }
+        else
+        {
+            if (m_ActivePath < 0)
+                return;
+            sourceName = m_Paths[m_ActivePath].name;
+            duration = m_Paths[m_ActivePath].duration;
+        }
 
         AnimationComponentMgr* pAnimMgr = AnimationComponentMgr::Get();
         if (pAnimMgr == nullptr || pAnimMgr->GetComponentCount() == 0)
@@ -432,16 +460,17 @@ namespace cauldron
         const std::vector<Component*>& components = pAnimMgr->GetComponentList();
         m_SessionEntityNames.clear();
         std::string entityJson;
+        const bool usePlaybackNames = m_PlaybackLoaded && m_PlaybackEntityNames.size() == components.size();
         for (size_t i = 0; i < components.size(); ++i)
         {
-            const std::wstring name = components[i]->GetOwner()->GetName();
+            const std::wstring name = usePlaybackNames ? m_PlaybackEntityNames[i] : components[i]->GetOwner()->GetName();
             m_SessionEntityNames.push_back(name);
             entityJson += (i > 0 ? "," : "");
             entityJson += "{\"id\":" + std::to_string(i) + ",\"name\":\"" + ToUtf8(name) + "\"}";
         }
         m_SessionEntityCount = static_cast<uint32_t>(m_SessionEntityNames.size());
 
-        m_RecordFileTag = path.name + "_lap" + std::to_string(m_Lap) + "_" + TimestampTag();
+        m_RecordFileTag = sourceName + "_lap" + std::to_string(m_Lap) + "_" + TimestampTag();
         m_RecordFilePath = dir / (m_RecordFileTag + ".posebin");
 
         m_RecordStream.open(m_RecordFilePath, std::ios::binary | std::ios::trunc);
@@ -455,9 +484,9 @@ namespace cauldron
 
         // JSON header (single line, closed by '\n'), then fixed-layout binary records
         std::string header = "{\"magic\":\"CAULDRON_POSE_V1\"";
-        header += ",\"path\":\"" + path.name + "\"";
+        header += ",\"path\":\"" + sourceName + "\"";
         header += ",\"lap\":" + std::to_string(m_Lap);
-        header += ",\"duration\":" + std::to_string(path.duration);
+        header += ",\"duration\":" + std::to_string(duration);
         header += ",\"layout\":\"frame u64, lap u32, anim_clock f64, delta_time f64, path_time f64, cam_pos f32[3], cam_look f32[3], cam_inv_view f32[16], count u32, matrices f32[16]*count\"";
         header += ",\"matrix_order\":\"row-major listing m[r][c]=Matrix4.getElem(col=c,row=r), world space\"";
         header += ",\"entities\":[" + entityJson + "]}";
@@ -494,9 +523,13 @@ namespace cauldron
 
     void AutoCameraController::RecordFrame(double deltaTime)
     {
-        // Session lifecycle: exists exactly while armed AND a path is playing. This
-        // enforces the ordering rule - arm first, then start the path.
-        const bool sessionWanted = m_Playing && m_RecordArmed && m_ActivePath >= 0;
+        // Session lifecycle: exists exactly while armed AND (a path is playing OR a
+        // playback take is running). This enforces the ordering rule - arm first.
+        // Playback takes additionally wait for entity binding so the take starts at
+        // the first truly overridden frame (no pre-bind scene-load tail).
+        const bool sessionWanted = m_Playing && m_RecordArmed
+                                   && (m_ActivePath >= 0 || m_PlaybackLoaded)
+                                   && (!m_PlaybackLoaded || m_PlaybackBound);
         if (!sessionWanted)
         {
             if (m_Recording)
@@ -565,6 +598,239 @@ namespace cauldron
         // Periodic flush so a crashed run still leaves a parseable take
         if ((m_FramesWritten % 600) == 0)
             m_RecordStream.flush();
+    }
+
+    bool AutoCameraController::LoadPosePlayback(const std::wstring& filePath)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(filePath, ec))
+        {
+            CauldronWarning(L"AutoCamera: playback file not found - '%ls'", filePath.c_str());
+            return false;
+        }
+
+        m_PlaybackStream.open(filePath, std::ios::binary);
+        if (!m_PlaybackStream)
+        {
+            CauldronWarning(L"AutoCamera: failed to open playback file '%ls'", filePath.c_str());
+            return false;
+        }
+
+        json header;
+        try
+        {
+            m_PlaybackStream >> header;
+        }
+        catch (const std::exception&)
+        {
+            CauldronWarning(L"AutoCamera: playback header parse failed - '%ls'", filePath.c_str());
+            m_PlaybackStream.close();
+            return false;
+        }
+        if (header.value("magic", std::string()) != "CAULDRON_POSE_V1")
+        {
+            CauldronWarning(L"AutoCamera: unsupported playback magic in '%ls'", filePath.c_str());
+            m_PlaybackStream.close();
+            return false;
+        }
+
+        const auto entitiesIt = header.find("entities");
+        if (entitiesIt == header.end() || !entitiesIt->is_array() || entitiesIt->empty())
+        {
+            CauldronWarning(L"AutoCamera: playback file has no entity table - '%ls'", filePath.c_str());
+            m_PlaybackStream.close();
+            return false;
+        }
+
+        m_PlaybackEntityNames.clear();
+        for (const auto& e : *entitiesIt)
+            m_PlaybackEntityNames.push_back(StringToWString(e.value("name", "")));
+        m_PlaybackEntityCount = static_cast<uint32_t>(m_PlaybackEntityNames.size());
+
+        // Consume the remainder of the header line; records start right after it
+        char c = 0;
+        while (m_PlaybackStream.get(c))
+        {
+            if (c == '\n')
+                break;
+        }
+        m_PlaybackDataStart = m_PlaybackStream.tellg();
+
+        m_PlaybackStream.seekg(0, std::ios::end);
+        const std::streamoff fileSize = m_PlaybackStream.tellg();
+        const std::streamoff bodySize = fileSize - m_PlaybackDataStart;
+        m_PlaybackStride = 8 + 4 + 8 + 8 + 8 + 12 + 12 + 64 + 4 + uint64_t(m_PlaybackEntityCount) * 64;
+        if (bodySize < static_cast<std::streamoff>(m_PlaybackStride))
+        {
+            CauldronWarning(L"AutoCamera: playback file too small (%lld bytes body) - '%ls'",
+                            static_cast<long long>(bodySize), filePath.c_str());
+            m_PlaybackStream.close();
+            return false;
+        }
+        m_PlaybackFrameCount = static_cast<uint64_t>(bodySize) / m_PlaybackStride;   // torn tail dropped
+        m_PlaybackDuration = header.value("duration", 0.0);
+        m_PlaybackSourceName = header.value("path", "take");
+        m_PlaybackFrame = 0;
+        m_PlaybackApplied.clear();
+        m_PlaybackPending.clear();
+        m_PlaybackPendingValid = false;
+        m_PlaybackLoaded = true;
+        m_Playing = true;
+        m_Lap = 1;
+
+        CauldronWarning(L"AutoCamera: playback loaded '%ls' - %llu frames, %u entities, %.1fs (%hs).",
+                        filePath.c_str(), static_cast<unsigned long long>(m_PlaybackFrameCount),
+                        m_PlaybackEntityCount, m_PlaybackDuration, m_PlaybackSourceName.c_str());
+        return true;
+    }
+
+    bool AutoCameraController::UpdatePlayback(CameraComponent* pCamera)
+    {
+        const InputState& inputState = GetInputManager()->GetInputState();
+        if (inputState.GetKeyUpState(Key_F7) || inputState.GetGamePadButtonUpState(Pad_Back))
+        {
+            m_Playing = false;
+            EndRecordingSession();
+            CauldronWarning(L"AutoCamera: playback stopped - free camera control restored (F7).");
+            return false;
+        }
+        if (inputState.GetKeyUpState(Key_F8))
+        {
+            m_PlaybackFrame = 0;
+            if (m_Recording)
+                EndRecordingSession();   // F8 = fresh take
+        }
+
+        // A scene change invalidates entity bindings; rebind on the next apply
+        const void* pScene = GetScene();
+        if (pScene != m_pLastScene)
+        {
+            m_pLastScene = pScene;
+            m_PlaybackBound = false;
+        }
+
+        if (!m_Playing || pCamera == nullptr)
+            return false;
+
+        // Hold at the current record until the scene's animated entities are all present
+        // (the binding condition of ApplyPlaybackTransforms). Otherwise the frame counter
+        // advances during scene loading and the take no longer aligns with its source.
+        if (!m_PlaybackBound)
+        {
+            AnimationComponentMgr* pAnimMgr = AnimationComponentMgr::Get();
+            if (pAnimMgr == nullptr || pAnimMgr->GetComponentCount() != m_PlaybackEntityCount)
+                return false;
+        }
+
+        if (m_PlaybackFrame >= m_PlaybackFrameCount)
+        {
+            m_PlaybackFrame = 0;    // seamless loop
+            ++m_Lap;
+            if (m_Recording)
+                EndRecordingSession();   // per-lap takes
+        }
+
+        m_PlaybackStream.clear();
+        m_PlaybackStream.seekg(m_PlaybackDataStart + static_cast<std::streamoff>(m_PlaybackFrame * m_PlaybackStride));
+        m_PlaybackRecord.resize(static_cast<size_t>(m_PlaybackStride));
+        m_PlaybackStream.read(m_PlaybackRecord.data(), static_cast<std::streamsize>(m_PlaybackStride));
+        if (m_PlaybackStream.gcount() != static_cast<std::streamsize>(m_PlaybackStride))
+        {
+            CauldronWarning(L"AutoCamera: playback read failed at frame %llu - stopping.",
+                            static_cast<unsigned long long>(m_PlaybackFrame));
+            m_Playing = false;
+            EndRecordingSession();
+            return false;
+        }
+
+        const char* rec = m_PlaybackRecord.data();
+        float camPos[3], camLook[3];
+        memcpy(camPos, rec + 36, sizeof(camPos));
+        memcpy(camLook, rec + 48, sizeof(camLook));
+        uint32_t count = 0;
+        memcpy(&count, rec + 124, sizeof(count));
+        if (count != m_PlaybackEntityCount)
+        {
+            CauldronWarning(L"AutoCamera: playback entity count mismatch at frame %llu - stopping.",
+                            static_cast<unsigned long long>(m_PlaybackFrame));
+            m_Playing = false;
+            EndRecordingSession();
+            return false;
+        }
+
+        m_PlaybackPending.resize(m_PlaybackEntityCount);
+        for (uint32_t i = 0; i < m_PlaybackEntityCount; ++i)
+        {
+            float vals[16];
+            memcpy(vals, rec + 128 + static_cast<size_t>(i) * 64, sizeof(vals));
+            Mat4 m = Mat4::identity();
+            for (int row = 0; row < 4; ++row)
+                for (int col = 0; col < 4; ++col)
+                    m.setElem(col, row, vals[row * 4 + col]);
+            m_PlaybackPending[i] = m;
+        }
+        m_PlaybackPendingValid = true;
+
+        m_LastPos = Vec4(camPos[0], camPos[1], camPos[2], 0.f);
+        m_LastLook = Vec4(camLook[0], camLook[1], camLook[2], 0.f);
+        pCamera->SetAnimatedPose(m_LastPos, m_LastLook);
+
+        ++m_PlaybackFrame;
+        return true;
+    }
+
+    void AutoCameraController::ApplyPlaybackTransforms()
+    {
+        if (!m_PlaybackLoaded || !m_Playing || !m_PlaybackPendingValid)
+            return;
+
+        AnimationComponentMgr* pAnimMgr = AnimationComponentMgr::Get();
+        if (pAnimMgr == nullptr)
+            return;
+
+        if (!m_PlaybackBound)
+        {
+            // Bind by index: the recorder wrote transforms in GetComponentList() order, which
+            // is deterministic for the same scene. Names are verified as a scene-identity check.
+            const std::vector<Component*>& components = pAnimMgr->GetComponentList();
+            if (components.size() != m_PlaybackEntityCount)
+            {
+                if (!m_PlaybackWarned)
+                {
+                    m_PlaybackWarned = true;
+                    CauldronWarning(L"AutoCamera: playback entity count mismatch (%u vs %u) - transforms not applied.",
+                                    m_PlaybackEntityCount, static_cast<uint32_t>(components.size()));
+                }
+                return;
+            }
+            m_PlaybackEntities.assign(m_PlaybackEntityCount, nullptr);
+            for (uint32_t i = 0; i < m_PlaybackEntityCount; ++i)
+            {
+                Entity* pEntity = components[i]->GetOwner();
+                if (wcscmp(pEntity->GetName(), m_PlaybackEntityNames[i].c_str()) != 0)
+                {
+                    CauldronWarning(L"AutoCamera: playback entity name mismatch at [%u] ('%ls' vs '%ls') - "
+                                    L"scene differs from the recording, transforms not applied.",
+                                    i, pEntity->GetName(), m_PlaybackEntityNames[i].c_str());
+                    return;
+                }
+                m_PlaybackEntities[i] = pEntity;
+            }
+            m_PlaybackApplied.assign(m_PlaybackEntityCount, Mat4::identity());
+            for (uint32_t i = 0; i < m_PlaybackEntityCount; ++i)
+                m_PlaybackApplied[i] = m_PlaybackPending[i];   // first frame: no motion yet
+            m_PlaybackBound = true;
+            CauldronWarning(L"AutoCamera: playback bound %u animated entities.", m_PlaybackEntityCount);
+        }
+
+        for (uint32_t i = 0; i < m_PlaybackEntityCount; ++i)
+        {
+            Entity* pEntity = m_PlaybackEntities[i];
+            pEntity->SetPrevTransform(m_PlaybackApplied[i]);   // motion vectors come from here
+            pEntity->SetTransform(m_PlaybackPending[i]);
+        }
+        m_PlaybackApplied = m_PlaybackPending;
+        m_PlaybackPendingValid = false;
     }
 
 } // namespace cauldron

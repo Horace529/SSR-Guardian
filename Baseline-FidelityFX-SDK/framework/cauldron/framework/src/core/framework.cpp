@@ -1667,6 +1667,7 @@ namespace cauldron
         // Pose-sequence recording (SSR-Guardian data capture). Must run after the component
         // update pass above so camera and animated entity transforms are final for the frame
         // that is about to be rendered.
+        AutoCameraController::Get().ApplyPlaybackTransforms();   // M1: override entities from posebin
         AutoCameraController::Get().RecordFrame(m_DeltaTime);
 
         // This can be closed out, new cmd lists will be opened after

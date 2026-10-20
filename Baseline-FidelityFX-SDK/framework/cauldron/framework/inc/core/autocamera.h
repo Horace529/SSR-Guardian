@@ -31,6 +31,7 @@
 namespace cauldron
 {
     class CameraComponent;
+    class Entity;
 
     /**
      * @struct AutoCamKeyframe
@@ -130,6 +131,24 @@ namespace cauldron
 
         bool IsRecording() const { return m_Recording; }
 
+        /**
+         * @brief   Loads a .posebin take for playback: the camera and every animated entity
+         *          are driven from the recorded sequence (transforms overridden after the
+         *          component update pass) instead of live path evaluation. Enabled via
+         *          CAULDRON_AUTO_PLAYBACK=<posebin path>. F7 stops, F8 restarts from frame 0.
+         * @returns true if the file was parsed and playback will start.
+         */
+        bool LoadPosePlayback(const std::wstring& filePath);
+
+        bool IsPlayback() const { return m_PlaybackLoaded; }
+
+        /**
+         * @brief   Applies the pending playback entity transforms (called from the framework
+         *          right before RecordFrame, so overridden transforms and any round-trip
+         *          recording both see the exact recorded state).
+         */
+        void ApplyPlaybackTransforms();
+
     private:
         AutoCameraController();
         AutoCameraController(const AutoCameraController&) = delete;
@@ -138,6 +157,7 @@ namespace cauldron
         void LoadPaths();
         void RestartLap();
         bool Evaluate(double t, Vec4& pos, Vec4& look) const;
+        bool UpdatePlayback(CameraComponent* pCamera);
 
         void StartRecordingSession();
         void EndRecordingSession();
@@ -149,6 +169,25 @@ namespace cauldron
         double                   m_PathTime = 0.0;
         uint32_t                 m_Lap = 0;
         const void*              m_pLastScene = nullptr;
+
+        // Pose playback (M1): drives camera + animated entities from a .posebin take
+        bool                      m_PlaybackLoaded = false;
+        bool                      m_PlaybackBound = false;     // entity name binding done
+        bool                      m_PlaybackWarned = false;    // bind-failure warning emitted
+        bool                      m_PlaybackPendingValid = false;
+        std::ifstream             m_PlaybackStream;
+        std::streamoff            m_PlaybackDataStart = 0;
+        uint64_t                  m_PlaybackStride = 0;
+        uint64_t                  m_PlaybackFrameCount = 0;
+        uint64_t                  m_PlaybackFrame = 0;         // next record to apply
+        uint32_t                  m_PlaybackEntityCount = 0;
+        double                    m_PlaybackDuration = 0.0;
+        std::string               m_PlaybackSourceName;        // take's origin path name
+        std::vector<std::wstring> m_PlaybackEntityNames;
+        std::vector<Entity*>      m_PlaybackEntities;          // bound scene entities, table order
+        std::vector<Mat4>         m_PlaybackApplied;           // last applied transforms (PrevTransform source)
+        std::vector<Mat4>         m_PlaybackPending;           // current record's transforms
+        std::vector<char>         m_PlaybackRecord;
 
         // Pose sequence recording
         bool                      m_RecordArmed = false;
