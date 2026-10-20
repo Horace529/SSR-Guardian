@@ -78,6 +78,7 @@ namespace cauldron
         }
 
         LoadPaths();
+        LoadPlaybackFileList();
 
         wchar_t playbackPath[MAX_PATH] = {};
         if (GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAYBACK", playbackPath, MAX_PATH) > 0 && playbackPath[0] != L'\0')
@@ -199,6 +200,12 @@ namespace cauldron
     {
         if (index >= m_Paths.size())
             return;
+
+        // Leave playback mode if active - the path branch owns the camera from here on
+        m_PlaybackLoaded = false;
+        if (m_PlaybackStream.is_open())
+            m_PlaybackStream.close();
+        EndRecordingSession();
 
         m_ActivePath = static_cast<int>(index);
         m_Playing = true;
@@ -377,7 +384,7 @@ namespace cauldron
         {
             const AutoCamPath& path = m_Paths[i];
             ImGui::PushID(static_cast<int>(i));
-            const bool active = m_Playing && m_ActivePath == static_cast<int>(i);
+            const bool active = m_Playing && !m_PlaybackLoaded && m_ActivePath == static_cast<int>(i);
             if (active)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.45f, 0.2f, 1.0f));
             if (ImGui::Button(path.name.c_str(), ImVec2(-1.f, 0.f)))
@@ -388,6 +395,36 @@ namespace cauldron
                 ImGui::SetTooltip("%s", path.description.c_str());
             ImGui::PopID();
         }
+
+        // Recorded takes available for playback (PoseRecorder output, newest first)
+        ImGui::Separator();
+        ImGui::TextUnformatted("Playback Takes");
+        if (ImGui::SmallButton("Refresh"))
+            LoadPlaybackFileList();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u take(s)", static_cast<uint32_t>(m_PlaybackFiles.size()));
+
+        for (size_t i = 0; i < m_PlaybackFiles.size(); ++i)
+        {
+            ImGui::PushID(static_cast<int>(1000 + i));
+            const std::filesystem::path takePath(m_PlaybackFiles[i]);
+            const std::string takeLabel = WStringToString(takePath.stem().wstring());
+            const bool active = m_Playing && m_PlaybackLoaded;
+            if (active)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.3f, 0.55f, 1.0f));
+            if (ImGui::Button(takeLabel.c_str(), ImVec2(-1.f, 0.f)))
+            {
+                StopAutomation();               // stop any live path + its recording first
+                LoadPosePlayback(m_PlaybackFiles[i]);
+            }
+            if (active)
+                ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Replay this take (camera + animated entities) from the recording.");
+            ImGui::PopID();
+        }
+        if (m_PlaybackFiles.empty())
+            ImGui::TextDisabled("No .posebin takes found - arm recording and run a path first.");
 
         ImGui::Spacing();
         if (ImGui::Button("Stop / Free Camera (F7)", ImVec2(-1.f, 0.f)))
@@ -600,6 +637,33 @@ namespace cauldron
             m_RecordStream.flush();
     }
 
+    void AutoCameraController::LoadPlaybackFileList()
+    {
+        m_PlaybackFiles.clear();
+
+        // Newest takes first so a fresh capture is always at the top of the UI
+        std::vector<std::pair<std::filesystem::file_time_type, std::wstring>> found;
+        for (const wchar_t* candidate : kAutoCamRecordingDirs)
+        {
+            std::filesystem::path dir(candidate);
+            std::error_code ec;
+            if (!std::filesystem::exists(dir, ec))
+                continue;
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (entry.is_regular_file(ec) && entry.path().extension() == L".posebin")
+                    found.emplace_back(entry.last_write_time(ec), entry.path().wstring());
+            }
+        }
+        std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (auto& f : found)
+            m_PlaybackFiles.push_back(f.second);
+
+        if (!m_PlaybackFiles.empty())
+            CauldronWarning(L"AutoCamera: %u playback take(s) available (F9-recorder output).",
+                            static_cast<uint32_t>(m_PlaybackFiles.size()));
+    }
+
     bool AutoCameraController::LoadPosePlayback(const std::wstring& filePath)
     {
         std::error_code ec;
@@ -608,6 +672,17 @@ namespace cauldron
             CauldronWarning(L"AutoCamera: playback file not found - '%ls'", filePath.c_str());
             return false;
         }
+
+        // Switching takes mid-playback: close the previous stream and reset binding state
+        if (m_PlaybackStream.is_open())
+            m_PlaybackStream.close();
+        if (m_Recording)
+            EndRecordingSession();
+        m_PlaybackBound = false;
+        m_PlaybackWarned = false;
+        m_PlaybackApplied.clear();
+        m_PlaybackPending.clear();
+        m_PlaybackPendingValid = false;
 
         m_PlaybackStream.open(filePath, std::ios::binary);
         if (!m_PlaybackStream)

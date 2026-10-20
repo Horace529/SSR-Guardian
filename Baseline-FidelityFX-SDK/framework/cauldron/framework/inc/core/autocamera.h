@@ -155,6 +155,7 @@ namespace cauldron
         AutoCameraController& operator=(const AutoCameraController&) = delete;
 
         void LoadPaths();
+        void LoadPlaybackFileList();
         void RestartLap();
         bool Evaluate(double t, Vec4& pos, Vec4& look) const;
         bool UpdatePlayback(CameraComponent* pCamera);
@@ -188,6 +189,7 @@ namespace cauldron
         std::vector<Mat4>         m_PlaybackApplied;           // last applied transforms (PrevTransform source)
         std::vector<Mat4>         m_PlaybackPending;           // current record's transforms
         std::vector<char>         m_PlaybackRecord;
+        std::vector<std::wstring> m_PlaybackFiles;             // discovered takes (full paths, newest first)
 
         // Pose sequence recording
         bool                      m_RecordArmed = false;
