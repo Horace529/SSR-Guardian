@@ -5,6 +5,10 @@
             "RT1.1": true,
             "ShaderModel": "SM6_5"
         },
+        "Presentation": {
+            "Width": 1920,
+            "Height": 1080
+        },
         "BuildRayTracingAccelerationStructure": true,
         "Allocations": {
             "GPUResourceViewCount": 600000,

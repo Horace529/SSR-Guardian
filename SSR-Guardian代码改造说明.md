@@ -1,6 +1,6 @@
 # SSR-Guardian 代码改造与新增功能说明
 
-> 更新：2026-10-20 ｜ 仓库：`D:\Projects\SSR-Guardian`（分支 main）
+> 更新：2026-11-02 ｜ 仓库：`D:\Projects\SSR-Guardian`（分支 main）
 > 基线来源：commit `12eb658`（AMD FidelityFX SDK 1.1.4 整体 vendored + 早期 SSR-Guardian 修改）
 > 姊妹文档：`SSR-Guardian技术路线.md`（技术决策与依据）；本文只记录"改了什么、在哪、怎么用"。
 
@@ -15,6 +15,7 @@
 | 自动镜头系统 | AutoCameraController + 5 条轨迹 + 生成脚本 | `12eb658` 内 |
 | 姿态序列录制器 | PoseRecorder（.posebin 数据采集） | `6d4d96f` |
 | 姿态回放器 | PosePlayback（.posebin 确定性重放，M1） | `9043784` |
+| Reference C 离线真值 | 全屏 RT + 256 子帧累积 + `apply_reflections` 合成 + 场景 tonemap，输出 1080p PNG | 本次 |
 | 示例配置 | HybridReflections 指向 Hangar 场景 | `12eb658` 内 |
 | 文档 | 技术路线 + 本文 | `ecf4f79` / 本次 |
 
@@ -209,11 +210,108 @@ entity_count u32 | 各动画实体世界矩阵 f32[16] × N（顺序 == 头内�
 
 ---
 
-## 6. 示例配置修改
+## 6. Reference C 离线真值采集（全屏 RT + 256 子帧 + 1080p PNG）
+
+**用途**：对每个 posebin 记录，用全屏全局 RT 计算反射，按 `apply_reflections` 的 BRDF/Fresnel/reflection_factor 合成到场景颜色，再走原 `Translucency` + `ToneMapping`，最后抓 `SwapChainProxy` 输出 PNG。这样参考图的光照、合成和 tonemap 与实时渲染一致，不再是 raw incoming radiance。
+
+**新增/修改文件**：
+
+| 文件 | 内容 |
+|---|---|
+| `samples/hybridreflections/hybridreflectionsrendermodule.h/.cpp` | ReferenceMode、全屏 reference pipeline、N 子帧累积、`apply_reflections` 合成、post-ToneMapping 抓图、PNG 输出 |
+| `samples/hybridreflections/shaders/reference_ray_tracing.hlsl` | 全屏 GGX VNDF RT + PBR 着色 + 环境回退；ray origin/TMin 与 `Intersect.hlsl` 对齐 |
+| `samples/hybridreflections/shaders/accumulate_reference.hlsl` | 同一 pose 的 N 子帧累积与归一化 |
+| `framework/cauldron/framework/inc/core/autocamera.h` / `src/core/autocamera.cpp` | `SetPlaybackHold()` / `AdvancePlaybackFrame()` / `IsPlaybackBound()` / `GetPlaybackFrame()` 等 |
+| `samples/hybridreflections/config/hybridreflectionsconfig.json` | `Presentation` 覆盖为 1920×1080 |
+
+**固定参数**：
+
+- 分辨率：**1920×1080**
+- 子帧：**256**
+- stride：**1**（逐帧）
+- 输出：**PNG RGBA8**，约 5.2MB/帧
+- 输出目录：`G:\SSR-Guardian\capture_beauty_1080p_256\<posebin名>\`
+- 完成 4949 帧：约 **22.57 GiB**，约 **2 小时 4 分**
+
+**编译（ReleaseDX12）**：
+
+```powershell
+$cmake = "D:\MicrosoftIDES\VisualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+Set-Location "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK"
+& $cmake --build build --config ReleaseDX12 --target FFX_HYBRIDREFLECTIONS --parallel
+```
+
+**前台运行**：
+
+```powershell
+$env:CAULDRON_REFERENCE_CAPTURE  = "1"
+$env:CAULDRON_AUTO_PLAYBACK      = "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\autocamera\recordings\01_floor_lanes_lap2_20261020_162752.posebin"
+$env:CAULDRON_CAPTURE_DIR        = "G:\SSR-Guardian\capture_beauty_1080p_256"
+$env:CAULDRON_CAPTURE_SUBFRAMES  = "256"
+$env:CAULDRON_CAPTURE_STRIDE     = "1"
+$env:CAULDRON_CAPTURE_MAX_FRAMES = "0"
+$env:CAULDRON_AUTO_RECORD        = "0"
+
+Set-Location "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\bin"
+.\FFX_HYBRIDREFLECTIONS_DX12.exe
+```
+
+**后台运行**：
+
+```powershell
+$env:CAULDRON_REFERENCE_CAPTURE  = "1"
+$env:CAULDRON_AUTO_PLAYBACK      = "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\autocamera\recordings\01_floor_lanes_lap2_20261020_162752.posebin"
+$env:CAULDRON_CAPTURE_DIR        = "G:\SSR-Guardian\capture_beauty_1080p_256"
+$env:CAULDRON_CAPTURE_SUBFRAMES  = "256"
+$env:CAULDRON_CAPTURE_STRIDE     = "1"
+$env:CAULDRON_CAPTURE_MAX_FRAMES = "0"
+$env:CAULDRON_AUTO_RECORD        = "0"
+
+$exe = "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\bin\FFX_HYBRIDREFLECTIONS_DX12.exe"
+$wd  = "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\bin"
+Start-Process -FilePath $exe -WorkingDirectory $wd -PassThru
+```
+
+**查看进度**：
+
+```powershell
+$dir = "G:\SSR-Guardian\capture_beauty_1080p_256\01_floor_lanes_lap2_20261020_162752"
+(Get-ChildItem $dir -Filter *.png | Measure-Object).Count
+Get-Content "$dir\frames.jsonl" -Tail 1
+```
+
+**只跑 1 帧做短测**：
+
+```powershell
+$env:CAULDRON_CAPTURE_MAX_FRAMES = "1"
+```
+
+**换别的轨迹**：只改 `CAULDRON_AUTO_PLAYBACK`，例如：
+
+```powershell
+$env:CAULDRON_AUTO_PLAYBACK = "D:\Projects\SSR-Guardian\Baseline-FidelityFX-SDK\autocamera\recordings\02_platform_orbit_lap4_20261020_162818.posebin"
+```
+
+输出目录会按 posebin 文件名自动分成对应子目录。
+
+**说明**：
+
+- `CAULDRON_CAPTURE_MAX_FRAMES=0` 表示跑完整条 posebin（4949 帧），实际帧数由 posebin 头里的时长/记录数决定。
+- 参考图输出的是最终 tone-mapped PNG，不是 raw HDR；如果后面训练需要 raw radiance，需要另开输出模式。
+- Reference C 只处理不透明几何的反射；`SimpleGlass` 仍由原 `TranslucencyRenderModule` 合成，和实时画面一致。
+
+---
+
+## 7. 示例配置修改
 
 `samples/hybridreflections/config/hybridreflectionsconfig.json`（构建时同步拷贝到 `bin/configs/`）：
 
 ```json
+"Presentation": {
+    "Width": 1920,
+    "Height": 1080
+},
+
 "Content": {
     "Scenes": [ "../media/Hangar/Hangar_1105.gltf" ],   // 原 HybridReflections/scene.gltf
     "Camera": "Hangar_Camera_000",                       // 原 "Camera"（Hangar 中不存在该名）
@@ -223,7 +321,7 @@ entity_count u32 | 各动画实体世界矩阵 f32[16] × N（顺序 == 头内�
 
 ---
 
-## 7. 文档资产
+## 8. 文档资产
 
 | 文件 | 内容 |
 |---|---|
@@ -233,7 +331,7 @@ entity_count u32 | 各动画实体世界矩阵 f32[16] × N（顺序 == 头内�
 
 ---
 
-## 8. 注意事项与已知边界
+## 9. 注意事项与已知边界
 
 1. `json.h` 的 filesystem 检测守卫是刻意的——升级该 vendored 库时保留其自带逻辑
 2. 录制器输出目录候选 `../autocamera/recordings` → `recordings`（相对 exe 工作目录 `bin/`）

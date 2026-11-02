@@ -32,6 +32,8 @@
 #include <FidelityFX/host/ffx_classifier.h>
 #include <FidelityFX/host/ffx_spd.h>
 
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace cauldron
@@ -47,6 +49,8 @@ namespace cauldron
     class RasterView;
     class IndirectWorkload;
 }  // namespace cauldron
+
+struct ReferenceCaptureReadback;
 
 /// @defgroup FfxHybridReflectionsSample FidelityFX Hybrid Reflections sample
 /// Sample documentation for FidelityFX Hybrid Reflections
@@ -107,6 +111,11 @@ public:
     void Execute(double deltaTime, cauldron::CommandList* pCmdList) override;
 
     /**
+     * Handles the previous frame's reference readback and the posebin capture state machine.
+     */
+    void OnPreFrame() override;
+
+    /**
      * Prepare shading information for raytracing passes.
      */
     virtual void OnNewContentLoaded(cauldron::ContentBlock* pContentBlock) override;
@@ -164,6 +173,20 @@ private:
     void ExecuteApplyReflections(double deltaTime, cauldron::CommandList* pCmdList);
 
     void UpdatePerFrameConstants();
+
+    // ------------------------------------------------------------------
+    // Offline reference capture (full-screen global RT, opaque-only)
+    // ------------------------------------------------------------------
+    void ParseReferenceCaptureEnv();
+    void InitReferenceCapture();
+    void ExecuteReferenceRayTracing(double deltaTime, cauldron::CommandList* pCmdList);
+    void ExecuteReferenceAccumulate(double deltaTime, cauldron::CommandList* pCmdList);
+    void CaptureBeautyCallback(double deltaTime, cauldron::CommandList* pCmdList);
+    void CreateReferenceReadback();
+    void ReadbackReferenceToDisk();
+    void WriteReferenceCaptureInfo();
+    void WriteReferenceFrameMetadata(const std::string& fileName, uint64_t hash64, uint64_t dataBytes);
+    void AdvanceReferencePose();
 
     float m_SceneSpecularIBLFactor;
 
@@ -332,6 +355,36 @@ private:
     cauldron::RootSignature*  m_pCopyDepthRootSignature = nullptr;
     cauldron::PipelineObject* m_pCopyDepthPipelineObj   = nullptr;
     cauldron::ParameterSet*   m_pCopyDepthParameters    = nullptr;
+
+    // Offline reference capture (full-screen global RT, opaque-only)
+    bool        m_ReferenceCaptureEnabled          = false;
+    bool        m_ReferenceCaptureReady            = false;
+    bool        m_ReferenceCapturePendingReadback  = false;
+    bool        m_ReferenceCaptureFinished         = false;
+    bool        m_ReferenceAccumInUavState         = false;
+    bool        m_ReferenceCompositeReady          = false;
+    uint32_t    m_ReferenceSubframe                = 0;
+    uint32_t    m_ReferenceSampleCount             = 256;
+    uint32_t    m_ReferenceStride                  = 1;
+    uint32_t    m_ReferenceMaxFrames               = 0;
+    uint32_t    m_ReferenceOutputFrame             = 0;
+    uint32_t    m_ReferenceWidth                   = 0;
+    uint32_t    m_ReferenceHeight                  = 0;
+    std::wstring m_ReferenceCaptureDir;
+    std::wstring m_ReferencePoseSource;
+    std::ofstream m_ReferenceFramesJsonl;
+
+    const cauldron::Texture* m_pReference          = nullptr;
+    const cauldron::Texture* m_pReferenceAccum     = nullptr;
+    const cauldron::Texture* m_pReferenceFinal     = nullptr;
+    const cauldron::Texture* m_pSwapChainProxy     = nullptr;
+    cauldron::PipelineObject* m_pReferencePipelineObj = nullptr;
+
+    cauldron::RootSignature*  m_pReferenceAccumRootSignature = nullptr;
+    cauldron::PipelineObject* m_pReferenceAccumPipelineObj   = nullptr;
+    cauldron::ParameterSet*   m_pReferenceAccumParameters    = nullptr;
+
+    ReferenceCaptureReadback* m_pReferenceReadback = nullptr;
 
     FrameInfo m_FrameInfoConstants;
 

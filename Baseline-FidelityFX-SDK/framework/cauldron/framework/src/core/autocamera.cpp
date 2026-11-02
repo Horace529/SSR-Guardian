@@ -738,6 +738,7 @@ namespace cauldron
         m_PlaybackApplied.clear();
         m_PlaybackPending.clear();
         m_PlaybackPendingValid = false;
+        m_PlaybackHold = false;
 
         m_PlaybackStream.open(filePath, std::ios::binary);
         if (!m_PlaybackStream)
@@ -763,6 +764,8 @@ namespace cauldron
             m_PlaybackStream.close();
             return false;
         }
+
+        m_PlaybackFilePath = filePath;
 
         const auto entitiesIt = header.find("entities");
         if (entitiesIt == header.end() || !entitiesIt->is_array() || entitiesIt->empty())
@@ -907,10 +910,13 @@ namespace cauldron
         m_LastLook = Vec4(camLook[0], camLook[1], camLook[2], 0.f);
         pCamera->SetAnimatedPose(m_LastPos, m_LastLook);
 
-        // Stride X: the next rendered frame skips X-1 records. m_PlaybackApplied (the
-        // PrevTransform source) is only updated once per rendered frame, so it always
-        // holds the previous RENDERED frame - motion vectors see the real temporal gap.
-        m_PlaybackFrame += NextStride();
+        // Hold (offline capture) freezes the record; the capture module advances it
+        // explicitly via AdvancePlaybackFrame(). Otherwise stride X skips X-1 records:
+        // m_PlaybackApplied (the PrevTransform source) is only updated once per rendered
+        // frame, so it always holds the previous RENDERED frame - motion vectors see the
+        // real temporal gap.
+        if (!m_PlaybackHold)
+            m_PlaybackFrame += NextStride();
         return true;
     }
 
@@ -979,7 +985,8 @@ namespace cauldron
             pEntity->SetTransform(m_PlaybackPending[i]);
         }
         m_PlaybackApplied = m_PlaybackPending;
-        m_PlaybackPendingValid = false;
+        if (!m_PlaybackHold)
+            m_PlaybackPendingValid = false;
     }
 
 } // namespace cauldron
