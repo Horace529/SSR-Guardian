@@ -95,13 +95,29 @@ float2 Hash22(float2 p)
     return frac(float2(p.x * p.y, p.x + p.y));
 }
 
+// R2 low-discrepancy sequence in [0, 1)^2, indexed by subframe. Used for sub-pixel
+// jitter so the accumulated samples cover the pixel footprint uniformly.
+float2 R2Sequence(uint frameIndex)
+{
+    const float2 a = float2(0.7548776662466927f, 0.5698402909980532f);
+    return frac(a * float(frameIndex + 1u));
+}
+
+// Sub-pixel offset in [-0.5, 0.5) pixels, de-correlated per pixel.
+float2 SubpixelJitter(int2 pixel, uint frameIndex)
+{
+    const float2 rotation = Hash22(float2(pixel));
+    return frac(R2Sequence(frameIndex) + rotation) - 0.5f;
+}
+
 // Same GGX VNDF sampling as Common.hlsl, but with a per-subframe decorrelation offset so
 // that N > 256 subframes keeps producing new samples instead of repeating the 256-entry
-// blue-noise sequence.
+// blue-noise sequence. Mirror surfaces are clamped to a tiny non-zero alpha so the
+// subframes still integrate a small cone instead of repeating one fixed direction.
 float3 SampleReflectionVectorSeeded(float3 view_direction, float3 normal, float roughness, int2 pixel, uint frameIndex)
 {
-    if (roughness < 0.001f)
-        return reflect(view_direction, normal);
+    const float minAlpha = 0.0025f;
+    float       alpha    = max(roughness, minAlpha);
 
     float3x3 tbn                = CreateTBN(normal);
     float3   view_direction_tbn = mul(-view_direction, tbn);
@@ -110,7 +126,7 @@ float3 SampleReflectionVectorSeeded(float3 view_direction, float3 normal, float 
                                                                 float(frameIndex) * 0.75487766625f));
     u = frac(u + offset);
 
-    float3 sampled_normal_tbn    = Sample_GGX_VNDF_Hemisphere(view_direction_tbn, roughness, u.x, u.y);
+    float3 sampled_normal_tbn    = Sample_GGX_VNDF_Hemisphere(view_direction_tbn, alpha, u.x, u.y);
     float3 reflected_direction_tbn = reflect(-view_direction_tbn, sampled_normal_tbn);
     return mul(reflected_direction_tbn, transpose(tbn));
 }
@@ -165,8 +181,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= width || tid.y >= height)
         return;
 
-    float2 screen_uv = (float2(tid.xy) + float2(0.5f, 0.5f)) / float2(width, height);
-    float  z         = g_gbuffer_depth.Load(int3(tid.xy, 0)).x;
+    // Sub-pixel jitter per subframe: holding the pose means the G-buffer is re-rendered
+    // identically, so shifting the reconstructed ray inside the pixel footprint is what
+    // anti-aliases the reflected image over the accumulated samples.
+    const float2 subpixel = SubpixelJitter(int2(tid.xy), g_frame_info.frame_index);
+    float2 screen_uv = (float2(tid.xy) + float2(0.5f, 0.5f) + subpixel) / float2(width, height);
+
+    // The reference target is 2x supersampled; the G-buffer is at output resolution.
+    // Take depth from the nearest G-buffer texel and interpolate normal/roughness at the
+    // sub-pixel position so the 2x2 samples actually see different surface bases.
+    const int2 base_pixel = int2(tid.xy) >> 1;
+    float  z         = g_gbuffer_depth.Load(int3(base_pixel, 0)).x;
 
     if (FFX_DNSR_Reflections_IsBackground(z))
     {
@@ -180,8 +205,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 camera_position            = ViewSpaceToWorldSpace(float4(0.0f, 0.0f, 0.0f, 1.0f), g_inv_view);
     float3 world_direction            = normalize(world_space_hit - camera_position);
 
-    float3 world_normal = normalize(g_gbuffer_normal.Load(int3(tid.xy, 0)).xyz * 2.0f - (1.0f).xxx);
-    float4 arm          = g_gbuffer_arm.Load(int3(tid.xy, 0));
+    float3 world_normal = normalize(g_gbuffer_normal.SampleLevel(samBRDF, screen_uv, 0).xyz * 2.0f - (1.0f).xxx);
+    float4 arm          = g_gbuffer_arm.SampleLevel(samBRDF, screen_uv, 0);
     float  roughness    = saturate(arm.g);   // G-Buffer stores linear roughness squared
 
     float3 reflected_direction = SampleReflectionVectorSeeded(world_direction, world_normal, roughness, int2(tid.xy), g_frame_info.frame_index);

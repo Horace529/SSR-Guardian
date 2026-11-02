@@ -55,10 +55,10 @@ set_target_properties(ffx_spd_native PROPERTIES
 					  IMPORTED_LOCATION_RELWITHDEBINFOVK "${SDK_ROOT}/bin/ffx_sdk/ffx_spd_${CMAKE_GENERATOR_PLATFORM}drel.lib")
 
 # HSR
-file(GLOB hsr_src
+file(GLOB hsr_src CONFIGURE_DEPENDS
 	${CMAKE_CURRENT_SOURCE_DIR}/*.h
 	${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
-file(GLOB hsr_shaders
+file(GLOB hsr_shaders CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.h
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsl)
 

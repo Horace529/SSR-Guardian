@@ -72,6 +72,10 @@ namespace samplercpp
 
 using namespace cauldron;
 
+// 2x2 supersampling for the offline reference pass: the reference textures are rendered at
+// (2 * output) resolution and box-downsampled when apply_reflections samples them.
+static constexpr uint32_t kReferenceSuperSample = 2;
+
 struct ReferenceCaptureReadback
 {
 #if defined(_DX12)
@@ -880,6 +884,7 @@ void HybridReflectionsRenderModule::WriteReferenceCaptureInfo()
     info["resolution"]          = { m_ReferenceWidth, m_ReferenceHeight };
     info["reference_format"]    = "PNG_RGBA8";
     info["subframes"]           = m_ReferenceSampleCount;
+    info["supersampling"]       = kReferenceSuperSample;
     info["stride"]              = m_ReferenceStride;
     info["max_frames"]          = m_ReferenceMaxFrames;
     info["reference_shader"]    = "reference_ray_tracing.hlsl";
@@ -947,22 +952,24 @@ void HybridReflectionsRenderModule::InitReferenceCapture()
     const ResolutionInfo& resInfo = GetFramework()->GetResolutionInfo();
     m_ReferenceWidth  = resInfo.RenderWidth;
     m_ReferenceHeight = resInfo.RenderHeight;
+    const uint32_t ssaaWidth  = m_ReferenceWidth * kReferenceSuperSample;
+    const uint32_t ssaaHeight = m_ReferenceHeight * kReferenceSuperSample;
 
     auto renderSizeFn = [](TextureDesc& desc, uint32_t, uint32_t, uint32_t renderingWidth, uint32_t renderingHeight) {
-        desc.Width  = renderingWidth;
-        desc.Height = renderingHeight;
+        desc.Width  = renderingWidth * kReferenceSuperSample;
+        desc.Height = renderingHeight * kReferenceSuperSample;
     };
 
     TextureDesc desc = TextureDesc::Tex2D(L"HSR_Reference", ResourceFormat::RGBA32_FLOAT,
-                                          m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+                                          ssaaWidth, ssaaHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
     m_pReference = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
 
     desc = TextureDesc::Tex2D(L"HSR_ReferenceAccum", ResourceFormat::RGBA32_FLOAT,
-                              m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+                              ssaaWidth, ssaaHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
     m_pReferenceAccum = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
 
     desc = TextureDesc::Tex2D(L"HSR_ReferenceFinal", ResourceFormat::RGBA32_FLOAT,
-                              m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+                              ssaaWidth, ssaaHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
     m_pReferenceFinal = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
 
     // Full-screen reference pipeline reuses the primary RT root signature and parameter set.
@@ -1082,7 +1089,16 @@ void HybridReflectionsRenderModule::ExecuteReferenceAccumulate(double deltaTime,
     m_pReferenceAccumParameters->Bind(pCmdList, m_pReferenceAccumPipelineObj);
     SetPipelineState(pCmdList, m_pReferenceAccumPipelineObj);
 
-    Dispatch(pCmdList, (m_ReferenceWidth + 7u) / 8u, (m_ReferenceHeight + 7u) / 8u, 1);
+    // The accumulation target is read-modify-written across subframe dispatches while
+    // staying in the UnorderedAccess state, so the API requires an explicit UAV barrier
+    // for the previous dispatch's writes to be visible to this one.
+    Barrier uavBarrier = Barrier::UAV(m_pReferenceAccum->GetResource());
+    ResourceBarrier(pCmdList, 1, &uavBarrier);
+
+    // Reference textures are supersampled, so dispatch at their (2x) dimensions.
+    const uint32_t accumWidth  = m_pReferenceAccum->GetDesc().Width;
+    const uint32_t accumHeight = m_pReferenceAccum->GetDesc().Height;
+    Dispatch(pCmdList, (accumWidth + 7u) / 8u, (accumHeight + 7u) / 8u, 1);
 
     const bool lastSubframe = (m_ReferenceSubframe + 1u >= m_ReferenceSampleCount);
     if (lastSubframe)
