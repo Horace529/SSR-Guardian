@@ -48,6 +48,10 @@ namespace cauldron
     // is easy to find and git-track; fallback keeps working from any cwd.
     static constexpr const wchar_t* kAutoCamRecordingDirs[] = { L"../autocamera/recordings", L"recordings" };
 
+    // Fixed RNG seed for random playback strides: restarting a take (F8 / reload) replays
+    // the exact same pacing schedule, keeping data-collection runs reproducible.
+    static constexpr uint32_t kStrideSeed = 0x53524721u;   // "SGR!"
+
     static std::string TimestampTag()
     {
         std::time_t now = std::time(nullptr);
@@ -75,6 +79,31 @@ namespace cauldron
         {
             m_RecordArmed = true;
             CauldronWarning(L"AutoCamera: pose recording armed via CAULDRON_AUTO_RECORD.");
+        }
+
+        // Playback stride: CAULDRON_AUTO_PLAYBACK_STRIDE=<S> fixes the stride (1..5);
+        // CAULDRON_AUTO_PLAYBACK_STRIDE_RAND=<X:Y> draws a per-frame random stride in
+        // [X, Y]. The random setting wins when both are present.
+        if (GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAYBACK_STRIDE_RAND", envValue, 64) > 0 && envValue[0] != L'\0')
+        {
+            int xmin = 0, ymax = 0;
+            if (swscanf_s(envValue, L"%d:%d", &xmin, &ymax) == 2 && xmin >= 1 && ymax > xmin)
+            {
+                m_StrideMode = StrideMode::Random;
+                m_StrideRandMin = xmin;
+                m_StrideRandMax = ymax;
+                CauldronWarning(L"AutoCamera: playback stride random [%d..%d] via CAULDRON_AUTO_PLAYBACK_STRIDE_RAND.", xmin, ymax);
+            }
+        }
+        else if (GetEnvironmentVariableW(L"CAULDRON_AUTO_PLAYBACK_STRIDE", envValue, 64) > 0 && envValue[0] != L'\0')
+        {
+            const int s = _wtoi(envValue);
+            if (s >= 1 && s <= 5)
+            {
+                m_StrideMode = StrideMode::Uniform;
+                m_StrideUniform = s;
+                CauldronWarning(L"AutoCamera: playback stride %d via CAULDRON_AUTO_PLAYBACK_STRIDE.", s);
+            }
         }
 
         LoadPaths();
@@ -375,8 +404,8 @@ namespace cauldron
         if (m_PlaybackLoaded && m_Playing)
         {
             ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "PLAYBACK: %s", m_PlaybackSourceName.c_str());
-            ImGui::Text("Frame %llu / %llu  (lap %u, F8 restarts)",
-                        static_cast<unsigned long long>(m_PlaybackFrame), static_cast<unsigned long long>(m_PlaybackFrameCount), m_Lap);
+            ImGui::Text("Frame %llu / %llu  (lap %u, last stride %d, F8 restarts)",
+                        static_cast<unsigned long long>(m_PlaybackFrame), static_cast<unsigned long long>(m_PlaybackFrameCount), m_Lap, m_LastStride);
         }
         ImGui::Spacing();
 
@@ -403,6 +432,32 @@ namespace cauldron
             LoadPlaybackFileList();
         ImGui::SameLine();
         ImGui::TextDisabled("%u take(s)", static_cast<uint32_t>(m_PlaybackFiles.size()));
+
+        // Playback stride: X == the next rendered frame skips X-1 records, so the rendered
+        // motion-vector / denoiser-history gap equals the real temporal gap (frame-pacing
+        // simulation). Applies immediately to subsequent advances.
+        if (ImGui::CollapsingHeader("Stride"))
+        {
+            const char* modes[] = { "Uniform (1-5)", "Random X~Y" };
+            int mode = (m_StrideMode == StrideMode::Random) ? 1 : 0;
+            if (ImGui::Combo("Stride Mode", &mode, modes, 2))
+                m_StrideMode = (mode == 0) ? StrideMode::Uniform : StrideMode::Random;
+            if (m_StrideMode == StrideMode::Uniform)
+            {
+                ImGui::SliderInt("Stride", &m_StrideUniform, 1, 5);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stride X: the next rendered frame skips X-1 records. 1 = fully continuous.");
+            }
+            else
+            {
+                ImGui::SliderInt("X (min stride)", &m_StrideRandMin, 1, 31);
+                m_StrideRandMax = std::max(m_StrideRandMax, m_StrideRandMin + 1);
+                ImGui::SliderInt("Y (max stride)", &m_StrideRandMax, m_StrideRandMin + 1, 32);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Each rendered frame advances a random stride in [X, Y]. Fixed seed: F8 / reload replays the same schedule.");
+            }
+            ImGui::TextDisabled("Last applied stride: %d", m_LastStride);
+        }
 
         for (size_t i = 0; i < m_PlaybackFiles.size(); ++i)
         {
@@ -746,6 +801,7 @@ namespace cauldron
         m_PlaybackDuration = header.value("duration", 0.0);
         m_PlaybackSourceName = header.value("path", "take");
         m_PlaybackFrame = 0;
+        m_StrideRng.seed(kStrideSeed);
         m_PlaybackApplied.clear();
         m_PlaybackPending.clear();
         m_PlaybackPendingValid = false;
@@ -772,6 +828,7 @@ namespace cauldron
         if (inputState.GetKeyUpState(Key_F8))
         {
             m_PlaybackFrame = 0;
+            m_StrideRng.seed(kStrideSeed);   // same (take, stride config) -> same pacing schedule
             if (m_Recording)
                 EndRecordingSession();   // F8 = fresh take
         }
@@ -850,8 +907,25 @@ namespace cauldron
         m_LastLook = Vec4(camLook[0], camLook[1], camLook[2], 0.f);
         pCamera->SetAnimatedPose(m_LastPos, m_LastLook);
 
-        ++m_PlaybackFrame;
+        // Stride X: the next rendered frame skips X-1 records. m_PlaybackApplied (the
+        // PrevTransform source) is only updated once per rendered frame, so it always
+        // holds the previous RENDERED frame - motion vectors see the real temporal gap.
+        m_PlaybackFrame += NextStride();
         return true;
+    }
+
+    uint32_t AutoCameraController::NextStride()
+    {
+        if (m_StrideMode == StrideMode::Random)
+        {
+            std::uniform_int_distribution<uint32_t> dist(static_cast<uint32_t>(m_StrideRandMin), static_cast<uint32_t>(m_StrideRandMax));
+            m_LastStride = static_cast<int>(dist(m_StrideRng));
+        }
+        else
+        {
+            m_LastStride = m_StrideUniform;
+        }
+        return static_cast<uint32_t>(m_LastStride);
     }
 
     void AutoCameraController::ApplyPlaybackTransforms()

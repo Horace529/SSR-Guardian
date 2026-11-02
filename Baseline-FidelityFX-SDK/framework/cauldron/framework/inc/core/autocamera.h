@@ -24,6 +24,7 @@
 
 #include "misc/math.h"
 
+#include <random>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -163,6 +164,7 @@ namespace cauldron
         void StartRecordingSession();
         void EndRecordingSession();
         static std::string ToUtf8(const std::wstring& text);
+        uint32_t NextStride();
 
         std::vector<AutoCamPath> m_Paths;
         int                      m_ActivePath = -1;
@@ -190,6 +192,19 @@ namespace cauldron
         std::vector<Mat4>         m_PlaybackPending;           // current record's transforms
         std::vector<char>         m_PlaybackRecord;
         std::vector<std::wstring> m_PlaybackFiles;             // discovered takes (full paths, newest first)
+
+        // Playback stride: X means the next rendered frame skips (X-1) records, so the
+        // rendered motion-vector / denoiser-history gap equals the real temporal gap
+        // (frame-pacing simulation for low-spec capture). The two modes are mutually
+        // exclusive; the random schedule is seeded per (re)start so a given
+        // (take, stride config) always replays the identical pacing.
+        enum class StrideMode { Uniform, Random };
+        StrideMode  m_StrideMode = StrideMode::Uniform;
+        int         m_StrideUniform = 1;         // Fixed stride (UI range 1..5)
+        int         m_StrideRandMin = 2;         // Per-frame random stride in [min, max], min < max
+        int         m_StrideRandMax = 5;
+        int         m_LastStride = 1;            // Stride used by the most recent advance (UI display)
+        std::mt19937 m_StrideRng;
 
         // Pose sequence recording
         bool                      m_RecordArmed = false;
