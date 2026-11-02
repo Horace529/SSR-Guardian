@@ -683,6 +683,7 @@ namespace cauldron
         m_PlaybackApplied.clear();
         m_PlaybackPending.clear();
         m_PlaybackPendingValid = false;
+        m_PlaybackHold = false;
 
         m_PlaybackStream.open(filePath, std::ios::binary);
         if (!m_PlaybackStream)
@@ -708,6 +709,8 @@ namespace cauldron
             m_PlaybackStream.close();
             return false;
         }
+
+        m_PlaybackFilePath = filePath;
 
         const auto entitiesIt = header.find("entities");
         if (entitiesIt == header.end() || !entitiesIt->is_array() || entitiesIt->empty())
@@ -850,7 +853,8 @@ namespace cauldron
         m_LastLook = Vec4(camLook[0], camLook[1], camLook[2], 0.f);
         pCamera->SetAnimatedPose(m_LastPos, m_LastLook);
 
-        ++m_PlaybackFrame;
+        if (!m_PlaybackHold)
+            ++m_PlaybackFrame;
         return true;
     }
 
@@ -905,7 +909,8 @@ namespace cauldron
             pEntity->SetTransform(m_PlaybackPending[i]);
         }
         m_PlaybackApplied = m_PlaybackPending;
-        m_PlaybackPendingValid = false;
+        if (!m_PlaybackHold)
+            m_PlaybackPendingValid = false;
     }
 
 } // namespace cauldron

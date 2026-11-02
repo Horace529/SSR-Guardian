@@ -143,6 +143,23 @@ namespace cauldron
         bool IsPlayback() const { return m_PlaybackLoaded; }
 
         /**
+         * @brief   Freezes playback on the current record. While held, UpdatePlayback re-applies
+         *          the same pose every render frame (used for multi-sample offline capture).
+         */
+        void SetPlaybackHold(bool hold) { m_PlaybackHold = hold; }
+
+        /**
+         * @brief   Advances to the next posebin record while staying held.
+         */
+        void AdvancePlaybackFrame() { ++m_PlaybackFrame; }
+
+        uint64_t GetPlaybackFrame() const { return m_PlaybackFrame; }
+        uint64_t GetPlaybackFrameCount() const { return m_PlaybackFrameCount; }
+        const std::wstring& GetPlaybackFilePath() const { return m_PlaybackFilePath; }
+        bool IsPlaybackHeld() const { return m_PlaybackHold; }
+        bool IsPlaybackBound() const { return m_PlaybackBound; }
+
+        /**
          * @brief   Applies the pending playback entity transforms (called from the framework
          *          right before RecordFrame, so overridden transforms and any round-trip
          *          recording both see the exact recorded state).
@@ -175,6 +192,8 @@ namespace cauldron
         bool                      m_PlaybackLoaded = false;
         bool                      m_PlaybackBound = false;     // entity name binding done
         bool                      m_PlaybackWarned = false;    // bind-failure warning emitted
+        bool                      m_PlaybackHold = false;      // freeze current record for multi-sample capture
+        std::wstring              m_PlaybackFilePath;          // source .posebin, for capture manifest
         bool                      m_PlaybackPendingValid = false;
         std::ifstream             m_PlaybackStream;
         std::streamoff            m_PlaybackDataStart = 0;

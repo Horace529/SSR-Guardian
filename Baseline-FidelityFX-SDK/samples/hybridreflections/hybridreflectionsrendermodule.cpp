@@ -24,6 +24,7 @@
 
 #include "hybridreflectionsrendermodule.h"
 
+#include "core/autocamera.h"
 #include "core/backend_interface.h"
 #include "core/components/meshcomponent.h"
 #include "core/framework.h"
@@ -36,7 +37,33 @@
 #include "render/rasterview.h"
 #include "render/dynamicresourcepool.h"
 #include "render/profiler.h"
+#include "render/texture.h"
+#include "render/commandlist.h"
+#include "render/rootsignaturedesc.h"
+#include "render/pipelinedesc.h"
+#include "render/device.h"
+#include "misc/helpers.h"
 #include "shaders/lightingcommon.h"
+#include "stb/stb_image_write.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+
+#if defined(_DX12)
+#include "render/dx12/commandlist_dx12.h"
+#include "render/dx12/device_dx12.h"
+#include "render/dx12/gpuresource_dx12.h"
+#include "dxheaders/include/directx/d3dx12.h"
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace samplercpp
 {
@@ -44,6 +71,27 @@ namespace samplercpp
 }
 
 using namespace cauldron;
+
+struct ReferenceCaptureReadback
+{
+#if defined(_DX12)
+    ID3D12Resource*                          pResource       = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT       layout          = {};
+    uint32_t                                 rowCount        = 0;
+    uint64_t                                 rowSizeInBytes  = 0;
+    uint64_t                                 totalBytes      = 0;
+    uint32_t                                 width           = 0;
+    uint32_t                                 height          = 0;
+#endif
+};
+
+struct ReferenceAccumCB
+{
+    uint32_t subframe    = 0;
+    uint32_t sampleCount = 0;
+    uint32_t pad0        = 0;
+    uint32_t pad1        = 0;
+};
 
 #define FFX_HYBRID_REFLECTIONS_CONTEXT_COUNT (FFX_CLASSIFIER_CONTEXT_COUNT + FFX_DENOISER_CONTEXT_COUNT + FFX_SPD_CONTEXT_COUNT)
 
@@ -65,11 +113,55 @@ static std::vector<const char*> BuildDebugOptions(bool enable)
     return debugOptions;
 }
 
+static std::wstring ReadCaptureEnvString(const wchar_t* name, const wchar_t* defaultValue)
+{
+    wchar_t buffer[4096] = {};
+    const DWORD length = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+    if (length > 0 && length < (sizeof(buffer) / sizeof(buffer[0])))
+        return std::wstring(buffer, length);
+    return std::wstring(defaultValue);
+}
+
+static uint32_t ReadCaptureEnvUInt(const wchar_t* name, uint32_t defaultValue)
+{
+    wchar_t buffer[128] = {};
+    const DWORD length = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+    if (length == 0 || length >= (sizeof(buffer) / sizeof(buffer[0])))
+        return defaultValue;
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(buffer, &end, 10);
+    return (end != buffer) ? static_cast<uint32_t>(value) : defaultValue;
+}
+
+static std::string ZeroPad(uint32_t value, int width)
+{
+    std::ostringstream stream;
+    stream << std::setw(width) << std::setfill('0') << value;
+    return stream.str();
+}
+
+static void Fnv1a64Update(uint64_t& hash, const uint8_t* data, size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+static uint64_t Fnv1a64(const uint8_t* data, size_t size)
+{
+    uint64_t hash = 1469598103934665603ull;
+    Fnv1a64Update(hash, data, size);
+    return hash;
+}
+
 void HybridReflectionsRenderModule::Init(const json& initData)
 {
     CauldronAssert(ASSERT_CRITICAL, GetFramework()->GetConfig()->RT_1_1, L"Error: Hybrid Reflections requires RT1.1");
     CauldronAssert(ASSERT_CRITICAL, GetFramework()->GetConfig()->MinShaderModel >= ShaderModel::SM6_5, L"Error: Hybrid Reflections requires SM6_5 or greater");
     CreateResources();
+    ParseReferenceCaptureEnv();
 
     m_RTInfoTables.m_Textures.reserve(MAX_TEXTURES_COUNT);
     m_RTInfoTables.m_Samplers.reserve(MAX_SAMPLERS_COUNT);
@@ -151,6 +243,7 @@ void HybridReflectionsRenderModule::Init(const json& initData)
 
     InitPrepareBlueNoise(initData);
     InitPrimaryRayTracing(initData);
+    InitReferenceCapture();
     InitHybridDeferred(initData);
     InitRTDeferred(initData);
     InitDeferredShadeRays(initData);
@@ -213,6 +306,24 @@ HybridReflectionsRenderModule::~HybridReflectionsRenderModule()
         delete m_pCopyDepthParameters;
         delete m_pCopyDepthPipelineObj;
         delete m_pCopyDepthRootSignature;
+
+        delete m_pReferenceAccumParameters;
+        delete m_pReferenceAccumPipelineObj;
+        delete m_pReferenceAccumRootSignature;
+        delete m_pReferencePipelineObj;
+
+#if defined(_DX12)
+        if (m_pReferenceReadback != nullptr)
+        {
+            if (m_pReferenceReadback->pResource != nullptr)
+                m_pReferenceReadback->pResource->Release();
+            delete m_pReferenceReadback;
+            m_pReferenceReadback = nullptr;
+        }
+#endif
+
+        if (m_ReferenceFramesJsonl.is_open())
+            m_ReferenceFramesJsonl.close();
     }
 }
 
@@ -647,6 +758,8 @@ void HybridReflectionsRenderModule::InitPrimaryRayTracing(const json& initData)
     signatureDesc.AddTextureSRVSet(4, ShaderBindStage::Compute, 1);
     signatureDesc.AddTextureSRVSet(5, ShaderBindStage::Compute, 1);
     signatureDesc.AddTextureSRVSet(6, ShaderBindStage::Compute, 1);
+    signatureDesc.AddTextureSRVSet(7, ShaderBindStage::Compute, 1);
+    signatureDesc.AddTextureSRVSet(8, ShaderBindStage::Compute, 1);
 
     signatureDesc.AddTextureSRVSet(SHADOW_MAP_BEGIN_SLOT, ShaderBindStage::Compute, MAX_SHADOW_MAP_TEXTURES_COUNT);  // shadow maps
 
@@ -687,6 +800,8 @@ void HybridReflectionsRenderModule::InitPrimaryRayTracing(const json& initData)
     m_pPrimaryRTParameters->SetTextureSRV(m_pNormal, ViewDimension::Texture2D, 1);
     m_pPrimaryRTParameters->SetAccelerationStructure(GetScene()->GetASManager()->GetTLAS(), 2);
     m_pPrimaryRTParameters->SetTextureSRV(m_pBlueNoiseTexture, ViewDimension::Texture2D, 6);
+    m_pPrimaryRTParameters->SetTextureSRV(m_pAoRoughnessMetallic, ViewDimension::Texture2D, 7);
+    m_pPrimaryRTParameters->SetTextureSRV(m_pAlbedo, ViewDimension::Texture2D, 8);
     m_pPrimaryRTParameters->SetTextureUAV(m_pDebugImage, ViewDimension::Texture2D, 0);
 
     ShadowMapResourcePool* pShadowMapResourcePool = GetFramework()->GetShadowMapResourcePool();
@@ -699,6 +814,412 @@ void HybridReflectionsRenderModule::InitPrimaryRayTracing(const json& initData)
     m_pPrimaryRTParameters->SetRootConstantBufferResource(GetDynamicBufferPool()->GetResource(), sizeof(SceneInformation), 1);
     m_pPrimaryRTParameters->SetRootConstantBufferResource(GetDynamicBufferPool()->GetResource(), sizeof(SceneLightingInformation), 2);
     m_pPrimaryRTParameters->SetRootConstantBufferResource(GetDynamicBufferPool()->GetResource(), sizeof(LightingCBData), 3);
+}
+
+void HybridReflectionsRenderModule::ParseReferenceCaptureEnv()
+{
+    if (ReadCaptureEnvUInt(L"CAULDRON_REFERENCE_CAPTURE", 0) == 0)
+        return;
+
+    AutoCameraController& camera = AutoCameraController::Get();
+    if (!camera.IsPlayback())
+    {
+        CauldronWarning(L"ReferenceCapture: CAULDRON_REFERENCE_CAPTURE=1 but no posebin playback is loaded. Capture disabled.");
+        return;
+    }
+
+    m_ReferenceSampleCount = std::max(1u, ReadCaptureEnvUInt(L"CAULDRON_CAPTURE_SUBFRAMES", 256));
+    m_ReferenceStride      = std::max(1u, ReadCaptureEnvUInt(L"CAULDRON_CAPTURE_STRIDE", 1));
+    m_ReferenceMaxFrames   = ReadCaptureEnvUInt(L"CAULDRON_CAPTURE_MAX_FRAMES", 0);
+    if (m_ReferenceMaxFrames == 0 && camera.GetPlaybackFrameCount() > 0)
+    {
+        m_ReferenceMaxFrames = static_cast<uint32_t>(
+            (camera.GetPlaybackFrameCount() + m_ReferenceStride - 1) / m_ReferenceStride);
+    }
+    m_ReferencePoseSource  = camera.GetPlaybackFilePath();
+
+    const std::wstring baseDir = ReadCaptureEnvString(L"CAULDRON_CAPTURE_DIR", L"G:\\SSR-Guardian\\capture");
+    std::filesystem::path takeName = std::filesystem::path(m_ReferencePoseSource).stem();
+    if (takeName.empty())
+        takeName = L"take";
+    const std::filesystem::path outputDir = std::filesystem::path(baseDir) / takeName;
+    m_ReferenceCaptureDir = outputDir.wstring();
+
+    std::error_code ec;
+    std::filesystem::create_directories(outputDir, ec);
+    if (ec)
+    {
+        CauldronWarning(L"ReferenceCapture: failed to create '%ls' (%S). Capture disabled.",
+                        outputDir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    const ResolutionInfo& resInfo = GetFramework()->GetResolutionInfo();
+    m_ReferenceWidth  = resInfo.RenderWidth;
+    m_ReferenceHeight = resInfo.RenderHeight;
+    m_ReferenceCaptureEnabled = true;
+    m_ReferenceCaptureReady   = false;
+    m_ReferenceCaptureFinished = false;
+    camera.SetPlaybackHold(true);
+
+    m_ReferenceFramesJsonl.open(outputDir / L"frames.jsonl", std::ios::out | std::ios::trunc);
+    WriteReferenceCaptureInfo();
+
+    CauldronWarning(L"ReferenceCapture: enabled dir='%ls' pose='%ls' subframes=%u stride=%u maxFrames=%u",
+                    outputDir.c_str(), m_ReferencePoseSource.c_str(),
+                    m_ReferenceSampleCount, m_ReferenceStride, m_ReferenceMaxFrames);
+}
+
+void HybridReflectionsRenderModule::WriteReferenceCaptureInfo()
+{
+    if (!m_ReferenceCaptureEnabled)
+        return;
+
+    json info;
+    info["pose_source"]         = WStringToString(m_ReferencePoseSource.c_str());
+    info["resolution"]          = { m_ReferenceWidth, m_ReferenceHeight };
+    info["reference_format"]    = "PNG_RGBA8";
+    info["subframes"]           = m_ReferenceSampleCount;
+    info["stride"]              = m_ReferenceStride;
+    info["max_frames"]          = m_ReferenceMaxFrames;
+    info["reference_shader"]    = "reference_ray_tracing.hlsl";
+    info["composite"]           = "scene lighting + full-screen RT reflection * apply_reflections weighting + scene tone mapping";
+    info["transparent_handling"] = "opaque RT reflection; existing translucency and tone mapping pass unchanged";
+    info["notes"]               = "final tone-mapped image; the RT reflection is accumulated over N subframes";
+
+    std::ofstream file(std::filesystem::path(m_ReferenceCaptureDir) / L"capture_info.json", std::ios::out | std::ios::trunc);
+    if (file)
+        file << info.dump(2) << std::endl;
+}
+
+void HybridReflectionsRenderModule::CreateReferenceReadback()
+{
+#if defined(_DX12)
+    if (m_pReferenceReadback != nullptr)
+    {
+        if (m_pReferenceReadback->pResource != nullptr)
+            m_pReferenceReadback->pResource->Release();
+        delete m_pReferenceReadback;
+        m_pReferenceReadback = nullptr;
+    }
+
+    m_pReferenceReadback = new ReferenceCaptureReadback();
+
+    D3D12_RESOURCE_DESC textureDesc = m_pSwapChainProxy->GetResource()->GetImpl()->DX12Desc();
+    GetDevice()->GetImpl()->DX12Device()->GetCopyableFootprints(
+        &textureDesc, 0, 1, 0,
+        &m_pReferenceReadback->layout,
+        &m_pReferenceReadback->rowCount,
+        &m_pReferenceReadback->rowSizeInBytes,
+        &m_pReferenceReadback->totalBytes);
+
+    D3D12_HEAP_PROPERTIES heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width            = m_pReferenceReadback->totalBytes;
+    bufferDesc.Height           = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels        = 1;
+    bufferDesc.Format           = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    CauldronThrowOnFail(GetDevice()->GetImpl()->DX12Device()->CreateCommittedResource(
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&m_pReferenceReadback->pResource)));
+
+    m_pReferenceReadback->width  = m_pSwapChainProxy->GetDesc().Width;
+    m_pReferenceReadback->height = m_pSwapChainProxy->GetDesc().Height;
+#endif
+}
+
+void HybridReflectionsRenderModule::InitReferenceCapture()
+{
+    if (!m_ReferenceCaptureEnabled)
+        return;
+
+    // The live classifier defaults to 32 blue-noise samples per pixel. That would make
+    // the offline reference sequence repeat every 32 subframes, so raising N would not
+    // actually add new samples. Use the full 256-entry blue-noise set for reference capture.
+    m_RandomSamplesPerPixel = 256;
+
+    const ResolutionInfo& resInfo = GetFramework()->GetResolutionInfo();
+    m_ReferenceWidth  = resInfo.RenderWidth;
+    m_ReferenceHeight = resInfo.RenderHeight;
+
+    auto renderSizeFn = [](TextureDesc& desc, uint32_t, uint32_t, uint32_t renderingWidth, uint32_t renderingHeight) {
+        desc.Width  = renderingWidth;
+        desc.Height = renderingHeight;
+    };
+
+    TextureDesc desc = TextureDesc::Tex2D(L"HSR_Reference", ResourceFormat::RGBA32_FLOAT,
+                                          m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+    m_pReference = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
+
+    desc = TextureDesc::Tex2D(L"HSR_ReferenceAccum", ResourceFormat::RGBA32_FLOAT,
+                              m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+    m_pReferenceAccum = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
+
+    desc = TextureDesc::Tex2D(L"HSR_ReferenceFinal", ResourceFormat::RGBA32_FLOAT,
+                              m_ReferenceWidth, m_ReferenceHeight, 1, 1, ResourceFlags::AllowUnorderedAccess);
+    m_pReferenceFinal = GetDynamicResourcePool()->CreateRenderTexture(&desc, renderSizeFn);
+
+    // Full-screen reference pipeline reuses the primary RT root signature and parameter set.
+    PipelineDesc psoDesc;
+    psoDesc.SetRootSignature(m_pPrimaryRTRootSignature);
+    DefineList defineList;
+    if (GetConfig()->InvertedDepth)
+        defineList.insert(std::make_pair(L"FFX_SSSR_OPTION_INVERTED_DEPTH", std::to_wstring(1)));
+    psoDesc.AddShaderDesc(ShaderBuildDesc::Compute(L"reference_ray_tracing.hlsl", L"main", ShaderModel::SM6_5, &defineList));
+    m_pReferencePipelineObj = PipelineObject::CreatePipelineObject(L"ReferenceRayTracing_PipelineObj", psoDesc);
+
+    // u0 now points at the reference texture instead of the debug image.
+    m_pPrimaryRTParameters->SetTextureUAV(m_pReference, ViewDimension::Texture2D, 0);
+
+    // Accumulation pipeline: reference SRV -> accum/final UAVs.
+    RootSignatureDesc accumSignature;
+    accumSignature.AddConstantBufferView(0, ShaderBindStage::Compute, 1);
+    accumSignature.AddTextureSRVSet(0, ShaderBindStage::Compute, 1);
+    accumSignature.AddTextureUAVSet(0, ShaderBindStage::Compute, 1);
+    accumSignature.AddTextureUAVSet(1, ShaderBindStage::Compute, 1);
+    m_pReferenceAccumRootSignature = RootSignature::CreateRootSignature(L"ReferenceAccum_RootSignature", accumSignature);
+
+    PipelineDesc accumPso;
+    accumPso.SetRootSignature(m_pReferenceAccumRootSignature);
+    accumPso.AddShaderDesc(ShaderBuildDesc::Compute(L"accumulate_reference.hlsl", L"main", ShaderModel::SM6_5, nullptr));
+    m_pReferenceAccumPipelineObj = PipelineObject::CreatePipelineObject(L"ReferenceAccum_PipelineObj", accumPso);
+
+    m_pReferenceAccumParameters = ParameterSet::CreateParameterSet(m_pReferenceAccumRootSignature);
+    m_pReferenceAccumParameters->SetTextureSRV(m_pReference, ViewDimension::Texture2D, 0);
+    m_pReferenceAccumParameters->SetTextureUAV(m_pReferenceAccum, ViewDimension::Texture2D, 0);
+    m_pReferenceAccumParameters->SetTextureUAV(m_pReferenceFinal, ViewDimension::Texture2D, 1);
+    m_pReferenceAccumParameters->SetRootConstantBufferResource(GetDynamicBufferPool()->GetResource(), sizeof(ReferenceAccumCB), 0);
+
+    m_pSwapChainProxy = GetFramework()->GetRenderTexture(L"SwapChainProxy");
+    CauldronAssert(ASSERT_CRITICAL, m_pSwapChainProxy != nullptr, L"ReferenceCapture: SwapChainProxy not found");
+
+    CreateReferenceReadback();
+    m_ReferenceCaptureReady = true;
+
+    // Capture the final tone-mapped image after the normal ToneMapping module has run.
+    ExecuteCallback callbackPostToneMapping = [this](double deltaTime, CommandList* pCmdList) { this->CaptureBeautyCallback(deltaTime, pCmdList); };
+    ExecutionTuple callbackPostToneMappingTuple = std::make_pair(L"HybridReflectionsRenderModule::CaptureBeautyCallback",
+                                                                 std::make_pair(this, callbackPostToneMapping));
+    GetFramework()->RegisterExecutionCallback(L"ToneMappingRenderModule", false, callbackPostToneMappingTuple);
+
+    CauldronWarning(L"ReferenceCapture: initialized %ux%u, %u subframes per pose.",
+                    m_ReferenceWidth, m_ReferenceHeight, m_ReferenceSampleCount);
+}
+
+void HybridReflectionsRenderModule::ExecuteReferenceRayTracing(double deltaTime, cauldron::CommandList* pCmdList)
+{
+    GPUScopedProfileCapture sampleMarker(pCmdList, L"Reference Ray Tracing");
+
+    Barrier toUav = Barrier::Transition(
+        m_pReference->GetResource(),
+        ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource,
+        ResourceState::UnorderedAccess);
+    ResourceBarrier(pCmdList, 1, &toUav);
+
+    LightingCBData lightingConstantData;
+    lightingConstantData.IBLFactor         = GetScene()->GetIBLFactor();
+    lightingConstantData.SpecularIBLFactor = GetScene()->GetSpecularIBLFactor();
+
+    BufferAddressInfo constantBuffers[4];
+    constantBuffers[0] = GetDynamicBufferPool()->AllocConstantBuffer(sizeof(FrameInfo), &m_FrameInfoConstants);
+    constantBuffers[1] = GetDynamicBufferPool()->AllocConstantBuffer(sizeof(SceneInformation), &GetScene()->GetSceneInfo());
+    constantBuffers[2] = GetDynamicBufferPool()->AllocConstantBuffer(sizeof(SceneLightingInformation), &GetScene()->GetSceneLightInfo());
+    constantBuffers[3] = GetDynamicBufferPool()->AllocConstantBuffer(sizeof(LightingCBData), &lightingConstantData);
+    for (uint32_t i = 0; i < 4; ++i)
+        m_pPrimaryRTParameters->UpdateRootConstantBuffer(&constantBuffers[i], i);
+
+    ShadowMapResourcePool* pShadowMapResourcePool = GetFramework()->GetShadowMapResourcePool();
+    for (uint32_t i = 0; i < pShadowMapResourcePool->GetRenderTargetCount(); ++i)
+        m_pPrimaryRTParameters->SetTextureSRV(pShadowMapResourcePool->GetRenderTarget(i), ViewDimension::Texture2D, SHADOW_MAP_BEGIN_SLOT + i);
+
+    m_pPrimaryRTParameters->Bind(pCmdList, m_pReferencePipelineObj);
+    SetPipelineState(pCmdList, m_pReferencePipelineObj);
+
+    const uint32_t width  = m_pReference->GetDesc().Width;
+    const uint32_t height = m_pReference->GetDesc().Height;
+    Dispatch(pCmdList, (width + 7u) / 8u, (height + 7u) / 8u, 1);
+
+    Barrier toSrv = Barrier::Transition(
+        m_pReference->GetResource(),
+        ResourceState::UnorderedAccess,
+        ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource);
+    ResourceBarrier(pCmdList, 1, &toSrv);
+}
+
+void HybridReflectionsRenderModule::ExecuteReferenceAccumulate(double deltaTime, cauldron::CommandList* pCmdList)
+{
+    GPUScopedProfileCapture sampleMarker(pCmdList, L"Reference Accumulate");
+
+    if (m_ReferenceSubframe == 0)
+    {
+        std::vector<Barrier> initial;
+        if (!m_ReferenceAccumInUavState)
+        {
+            initial.push_back(Barrier::Transition(
+                m_pReferenceAccum->GetResource(),
+                ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource,
+                ResourceState::UnorderedAccess));
+            m_ReferenceAccumInUavState = true;
+        }
+        initial.push_back(Barrier::Transition(
+            m_pReferenceFinal->GetResource(),
+            ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource,
+            ResourceState::UnorderedAccess));
+        ResourceBarrier(pCmdList, static_cast<uint32_t>(initial.size()), initial.data());
+    }
+
+    ReferenceAccumCB constants;
+    constants.subframe    = m_ReferenceSubframe;
+    constants.sampleCount = m_ReferenceSampleCount;
+    BufferAddressInfo constantBuffer = GetDynamicBufferPool()->AllocConstantBuffer(sizeof(constants), &constants);
+    m_pReferenceAccumParameters->UpdateRootConstantBuffer(&constantBuffer, 0);
+    m_pReferenceAccumParameters->Bind(pCmdList, m_pReferenceAccumPipelineObj);
+    SetPipelineState(pCmdList, m_pReferenceAccumPipelineObj);
+
+    Dispatch(pCmdList, (m_ReferenceWidth + 7u) / 8u, (m_ReferenceHeight + 7u) / 8u, 1);
+
+    const bool lastSubframe = (m_ReferenceSubframe + 1u >= m_ReferenceSampleCount);
+    if (lastSubframe)
+    {
+        Barrier toSrv = Barrier::Transition(
+            m_pReferenceFinal->GetResource(),
+            ResourceState::UnorderedAccess,
+            ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource);
+        ResourceBarrier(pCmdList, 1, &toSrv);
+    }
+
+    ++m_ReferenceSubframe;
+}
+
+void HybridReflectionsRenderModule::CaptureBeautyCallback(double deltaTime, cauldron::CommandList* pCmdList)
+{
+    if (!m_ReferenceCaptureEnabled || !m_ReferenceCompositeReady || m_ReferenceCapturePendingReadback)
+        return;
+
+#if defined(_DX12)
+    if (m_pReferenceReadback == nullptr || m_pReferenceReadback->pResource == nullptr || m_pSwapChainProxy == nullptr)
+        return;
+
+    Barrier toCopy = Barrier::Transition(
+        m_pSwapChainProxy->GetResource(),
+        ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource,
+        ResourceState::CopySource);
+    ResourceBarrier(pCmdList, 1, &toCopy);
+
+    CD3DX12_TEXTURE_COPY_LOCATION destination(m_pReferenceReadback->pResource, m_pReferenceReadback->layout);
+    CD3DX12_TEXTURE_COPY_LOCATION source(const_cast<ID3D12Resource*>(m_pSwapChainProxy->GetResource()->GetImpl()->DX12Resource()), 0);
+    pCmdList->GetImpl()->DX12CmdList()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+    Barrier toSrv = Barrier::Transition(
+        m_pSwapChainProxy->GetResource(),
+        ResourceState::CopySource,
+        ResourceState::NonPixelShaderResource | ResourceState::PixelShaderResource);
+    ResourceBarrier(pCmdList, 1, &toSrv);
+
+    m_ReferenceCapturePendingReadback = true;
+#endif
+}
+
+void HybridReflectionsRenderModule::ReadbackReferenceToDisk()
+{
+#if defined(_DX12)
+    if (m_pReferenceReadback == nullptr || m_pReferenceReadback->pResource == nullptr)
+        return;
+
+    GetDevice()->FlushAllCommandQueues();
+
+    D3D12_RANGE readRange = { 0, static_cast<SIZE_T>(m_pReferenceReadback->totalBytes) };
+    void* mappedData = nullptr;
+    if (FAILED(m_pReferenceReadback->pResource->Map(0, &readRange, &mappedData)) || mappedData == nullptr)
+    {
+        CauldronWarning(L"ReferenceCapture: failed to map readback buffer.");
+        return;
+    }
+
+    AutoCameraController& camera = AutoCameraController::Get();
+    const uint32_t poseIndex = static_cast<uint32_t>(camera.GetPlaybackFrame());
+    const std::string fileName = "reference_" + ZeroPad(m_ReferenceOutputFrame, 6) + "_pose_" + ZeroPad(poseIndex, 6) + ".png";
+    const std::filesystem::path outputPath = std::filesystem::path(m_ReferenceCaptureDir) / fileName;
+
+    const int pngResult = stbi_write_png(
+        WStringToString(outputPath.c_str()).c_str(),
+        static_cast<int>(m_pReferenceReadback->width),
+        static_cast<int>(m_pReferenceReadback->height),
+        4,
+        mappedData,
+        static_cast<int>(m_pReferenceReadback->layout.Footprint.RowPitch));
+
+    if (pngResult == 0)
+        CauldronWarning(L"ReferenceCapture: failed to write '%ls'.", outputPath.c_str());
+    else
+        WriteReferenceFrameMetadata(fileName, 0, m_pReferenceReadback->rowSizeInBytes * m_pReferenceReadback->rowCount);
+
+    D3D12_RANGE writtenRange = { 0, 0 };
+    m_pReferenceReadback->pResource->Unmap(0, &writtenRange);
+#endif
+
+    m_ReferenceCapturePendingReadback = false;
+    m_ReferenceCompositeReady = false;
+    ++m_ReferenceOutputFrame;
+    AdvanceReferencePose();
+}
+
+void HybridReflectionsRenderModule::WriteReferenceFrameMetadata(const std::string& fileName, uint64_t hash64, uint64_t dataBytes)
+{
+    if (!m_ReferenceFramesJsonl)
+        return;
+
+    AutoCameraController& camera = AutoCameraController::Get();
+    json frame;
+    frame["output_frame"]      = m_ReferenceOutputFrame;
+    frame["pose_record_index"] = camera.GetPlaybackFrame();
+    frame["pose_source"]       = WStringToString(m_ReferencePoseSource.c_str());
+    frame["file"]              = fileName;
+    frame["width"]             = m_ReferenceWidth;
+    frame["height"]            = m_ReferenceHeight;
+    frame["format"]            = "PNG_RGBA8";
+    frame["row_bytes"]         = m_pReferenceReadback ? m_pReferenceReadback->rowSizeInBytes : 0;
+    frame["data_bytes"]        = dataBytes;
+    frame["hash64"]            = hash64;
+    frame["subframes"]         = m_ReferenceSampleCount;
+
+    m_ReferenceFramesJsonl << frame.dump() << "\n";
+    m_ReferenceFramesJsonl.flush();
+}
+
+void HybridReflectionsRenderModule::AdvanceReferencePose()
+{
+    AutoCameraController& camera = AutoCameraController::Get();
+    for (uint32_t i = 0; i < m_ReferenceStride; ++i)
+        camera.AdvancePlaybackFrame();
+
+    m_ReferenceSubframe = 0;
+
+    if (m_ReferenceMaxFrames > 0 && m_ReferenceOutputFrame >= m_ReferenceMaxFrames)
+    {
+        m_ReferenceCaptureEnabled  = false;
+        m_ReferenceCaptureFinished = true;
+        camera.SetPlaybackHold(false);
+        CauldronWarning(L"ReferenceCapture: finished %u frame(s).", m_ReferenceOutputFrame);
+#if defined(_WIN32)
+        PostQuitMessage(0);
+#endif
+    }
+}
+
+void HybridReflectionsRenderModule::OnPreFrame()
+{
+    if (m_ReferenceCapturePendingReadback)
+        ReadbackReferenceToDisk();
+
+    if (m_ReferenceCaptureEnabled && !m_ReferenceCaptureFinished)
+        AutoCameraController::Get().SetPlaybackHold(true);
 }
 
 void HybridReflectionsRenderModule::InitHybridDeferred(const json& initData)
@@ -1169,6 +1690,26 @@ void HybridReflectionsRenderModule::Execute(double deltaTime, CommandList* pCmdL
     m_ReflectionWidth  = std::max(128u, uint32_t(width * m_ReflectionResolutionMultiplier));
     m_ReflectionHeight = std::max(128u, uint32_t(height * m_ReflectionResolutionMultiplier));
     UpdatePerFrameConstants();
+
+    if (m_ReferenceCaptureEnabled && m_ReferenceCaptureReady && AutoCameraController::Get().IsPlaybackBound())
+    {
+        ExecutePrepareBlueNoise(deltaTime, pCmdList);
+        ExecuteReferenceRayTracing(deltaTime, pCmdList);
+        ExecuteReferenceAccumulate(deltaTime, pCmdList);
+
+        // On the last subframe, composite the accumulated RT reflection into the scene color
+        // with the same apply_reflections shader used by the live pipeline.
+        if (m_ReferenceSubframe >= m_ReferenceSampleCount)
+        {
+            m_pParamSet->SetTextureSRV(m_pReferenceFinal, ViewDimension::Texture2D, 0);
+            ExecuteApplyReflections(deltaTime, pCmdList);
+            m_ReferenceCompositeReady = true;
+        }
+
+        ++m_FrameIndex;
+        GetFramework()->SetUpscalingState(UpscalerState::PostUpscale);
+        return;
+    }
 
     GPUScopedProfileCapture sampleMarker(pCmdList, L"FFX HSR");
 
